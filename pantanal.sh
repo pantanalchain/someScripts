@@ -42,7 +42,7 @@ EOF
 sudo rm -rf ~/.ethereum/Pantanal/geth/ ~/.ethereum/Pantanal/history
 
 # Step 9: Start geth
-nohup  geth --Pantanal --port 30303 --miner.gasprice 5000000000 --http --http.addr 0.0.0.0 --http.corsdomain "*" --http.port "8545" --http.api "eth, net, web3, txpool, debug" --ws --ws.port 9545 --ws.addr 0.0.0.0 --ws.origins "*" --ws.api "web3, net, eth, txpool, debug, clique" --maxpeers=100 --allow-insecure-unlock --syncmode full --gcmode archive >/dev/null 2>./geth0.log &
+nohup  geth --Pantanal --port 30303 --miner.gasprice 5000000000 --http --http.addr 0.0.0.0 --http.corsdomain "*" --http.port "8545" --http.api "eth, net, web3, txpool, debug, clique" --ws --ws.port 9545 --ws.addr 0.0.0.0 --ws.origins "*" --ws.api "web3, net, eth, txpool, debug, clique" --maxpeers=100 --allow-insecure-unlock --syncmode full --gcmode archive >/dev/null 2>./geth0.log &
 
 
 # Step 10: Start mine
