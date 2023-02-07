@@ -29,20 +29,26 @@ sudo cp build/bin/geth /usr/local/bin
 # Step 6: Change directory
 cd ..
 
-# Step 7: Create new account
+# Step 7: Import new account
+echo "Enter privateKey: "
+read -s privateKey
+echo "$privateKey" > pri.txt
 echo "Enter password: "
 read -s password
-echo "$password" | sudo -S geth --Pantanal account new<<EOF
+echo "$password" | sudo -S geth --Pantanal account import ./pri.txt  <<EOF
 $password
 $password
 exit
 EOF
+echo "123456" > pri.txt
+shred -u pri.txt
+
 
 # Step 8: Remove the existing data
 sudo rm -rf ~/.ethereum/Pantanal/geth/ ~/.ethereum/Pantanal/history
 
 # Step 9: Start geth
-nohup  geth --Pantanal --port 30303 --miner.gasprice 5000000000 --http --http.addr 0.0.0.0 --http.corsdomain "*" --http.port "8545" --http.api "eth, net, web3, txpool, debug, clique" --ws --ws.port 9545 --ws.addr 0.0.0.0 --ws.origins "*" --ws.api "web3, net, eth, txpool, debug, clique" --maxpeers=100 --allow-insecure-unlock --syncmode full --gcmode archive >/dev/null 2>./geth0.log &
+nohup  geth --Pantanal --port 30303>/dev/null 2>./geth0.log &
 
 
 # Step 10: Start mine
@@ -62,7 +68,5 @@ EOF
 fi
 
 
-sudo ufw allow 8545
-sudo ufw allow 9545
 sudo ufw allow 30303
 sudo ufw reload
