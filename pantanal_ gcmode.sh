@@ -7,7 +7,9 @@ if ! dpkg -s golang-go >/dev/null 2>&1; then
 fi
 
 # Step 2: Create directory "/pantanal"
-if [ ! -d "/pantanal" ]; then
+if [ -d "/pantanal" ]; then
+  sudo rm -r /pantanal
+else
   sudo mkdir /pantanal
 fi
 
