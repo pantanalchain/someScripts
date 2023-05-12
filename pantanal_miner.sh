@@ -9,9 +9,8 @@ fi
 # Step 2: Create directory "/pantanal"
 if [ -d "/pantanal" ]; then
   sudo rm -r /pantanal
-else
-  sudo mkdir /pantanal
 fi
+sudo mkdir /pantanal
 
 # Step 3: Download and extract the repository
 cd /pantanal
