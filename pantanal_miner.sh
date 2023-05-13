@@ -31,6 +31,8 @@ sudo cp build/bin/geth /usr/local/bin
 cd ..
 
 # Step 7: Import new account
+sudo rm -rf ~/.ethereum
+
 echo "Enter privateKey: "
 read -s privateKey
 echo "$privateKey" > pri.txt
@@ -46,7 +48,7 @@ shred -u pri.txt
 
 
 # Step 8: Remove the existing data
-sudo rm -rf ~/.ethereum
+sudo rm -rf ~/.ethereum/Pantanal/geth/ ~/.ethereum/Pantanal/history
 
 # Step 9: Start geth
 nohup  geth --Pantanal --port 30303 --syncmode full >/dev/null 2>./geth0.log &
