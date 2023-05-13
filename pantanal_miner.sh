@@ -32,7 +32,6 @@ cd ..
 
 # Step 7: Import new account
 sudo rm -rf ~/.ethereum
-
 echo "Enter privateKey: "
 read -s privateKey
 echo "$privateKey" > pri.txt
