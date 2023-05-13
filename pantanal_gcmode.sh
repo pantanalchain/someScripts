@@ -31,6 +31,7 @@ sudo cp build/bin/geth /usr/local/bin
 cd ..
 
 # Step 7: Create new account
+sudo rm -rf ~/.ethereum
 echo "Enter password: "
 read -s password
 echo "$password" | sudo -S geth --Pantanal account new<<EOF
