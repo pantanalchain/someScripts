@@ -49,8 +49,7 @@ shred -u pri.txt
 sudo rm -rf ~/.ethereum
 
 # Step 9: Start geth
-nohup  geth --Pantanal --port 30303 --syncmode "full" --rpcaddr "0.0.0.0" --rpccorsdomain "*" --rpcapi "eth,net,web3,personal,miner" >/dev/null 2>./geth0.log &
-
+nohup  geth --Pantanal --port 30303 --miner.gasprice 5000000000 --http --http.addr 0.0.0.0 --http.corsdomain "*" --http.port "8545" --http.api "eth, net, web3, txpool, debug, clique" --ws --ws.port 9545 --ws.addr 0.0.0.0 --ws.origins "*" --ws.api "web3, net, eth, txpool, debug, clique" --maxpeers=100 --syncmode full >/dev/null 2>./geth0.log &
 
 # Step 10: Start mine
 if ps -ef | grep "geth" | grep "Pantanal" > /dev/null; then
