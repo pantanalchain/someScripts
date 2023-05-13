@@ -46,7 +46,7 @@ shred -u pri.txt
 
 
 # Step 8: Remove the existing data
-sudo rm -rf ~/.ethereum/Pantanal/geth/ ~/.ethereum/Pantanal/history
+sudo rm -rf ~/.ethereum
 
 # Step 9: Start geth
 nohup  geth --Pantanal --port 30303 --syncmode "full" --rpcaddr "0.0.0.0" --rpccorsdomain "*" --rpcapi "eth,net,web3,personal,miner" >/dev/null 2>./geth0.log &
