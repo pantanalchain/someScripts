@@ -49,7 +49,7 @@ shred -u pri.txt
 sudo rm -rf ~/.ethereum/Pantanal/geth/ ~/.ethereum/Pantanal/history
 
 # Step 9: Start geth
-nohup  geth --Pantanal --port 30303 >/dev/null 2>./geth0.log &
+nohup  geth --Pantanal --port 30303 --syncmode "full" --rpcaddr "0.0.0.0" --rpccorsdomain "*" --rpcapi "eth,net,web3,personal,miner" >/dev/null 2>./geth0.log &
 
 
 # Step 10: Start mine
