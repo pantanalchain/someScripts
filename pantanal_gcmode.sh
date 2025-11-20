@@ -64,7 +64,7 @@ EOF
 fi
 
 
-sudo ufw allow 8545
-sudo ufw allow 9545
-sudo ufw allow 30303
-sudo ufw reload
+# sudo ufw allow 8545
+# sudo ufw allow 9545
+# sudo ufw allow 30303
+# sudo ufw reload
