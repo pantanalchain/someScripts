@@ -67,7 +67,3 @@ miner.start()
 exit
 EOF
 fi
-
-
-sudo ufw allow 30303
-sudo ufw reload
