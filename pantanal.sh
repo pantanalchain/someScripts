@@ -70,13 +70,6 @@ prompt_choice() {
     done
 }
 
-prompt_line() {
-    local reply
-    printf '%s' "$1" >/dev/tty
-    IFS= read -r reply </dev/tty || return 1
-    printf '%s\n' "$reply"
-}
-
 prompt_secret() {
     local first second
     while true; do
@@ -160,11 +153,15 @@ load_node_conf() {
         case "$key" in
             GCMODE) GCMODE=$value ;;
             CONSOLE) CONSOLE=$value ;;
-            CONSOLE_ADDR) CONSOLE_ADDR=$value ;;
             CONSOLE_PASSWORD_FILE) CONSOLE_PASSWORD_FILE=$value ;;
         esac
     done < "$NODE_CONF"
     [[ "$GCMODE" == archive ]] || GCMODE=full
+    # 旧配置里的外网地址不再使用。控制台只绑定本机。
+    if [[ "$CONSOLE" != off ]]; then
+        CONSOLE=local
+    fi
+    CONSOLE_ADDR="127.0.0.1"
 }
 
 save_node_conf() {
@@ -204,35 +201,20 @@ choose_gcmode() {
 }
 
 choose_console() {
-    local choice addr
-    choice=$(prompt_choice "手机控制台" \
+    local choice
+    choice=$(prompt_choice "手机控制台（只绑定本机，不对外网开放）" \
         "不开启" \
-        "只监听 127.0.0.1:${CONSOLE_PORT}" \
-        "监听指定地址的 ${CONSOLE_PORT}")
-    case "$choice" in
-        2)
-            CONSOLE=local
-            CONSOLE_ADDR="127.0.0.1"
-            save_console_password
-            log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
-            ;;
-        3)
-            addr=$(prompt_line "监听地址（例如 0.0.0.0）: ")
-            if [[ -z "$addr" ]]; then
-                log "未输入地址，手机控制台不开启"
-                CONSOLE=off
-                return 0
-            fi
-            CONSOLE=addr
-            CONSOLE_ADDR=$addr
-            save_console_password
-            log "手机控制台: ${CONSOLE_ADDR}:${CONSOLE_PORT}"
-            ;;
-        *)
-            CONSOLE=off
-            log "手机控制台: 不开启"
-            ;;
-    esac
+        "只监听 127.0.0.1:${CONSOLE_PORT}")
+    if [[ "$choice" == 2 ]]; then
+        CONSOLE=local
+        CONSOLE_ADDR="127.0.0.1"
+        save_console_password
+        log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
+        return 0
+    fi
+    CONSOLE=off
+    CONSOLE_ADDR="127.0.0.1"
+    log "手机控制台: 不开启"
 }
 
 remote_asset_meta() {
@@ -389,32 +371,21 @@ stop_geth() {
 console_args() {
     local -n _out=$1
     _out=()
-    if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" || -n "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
-        _out+=(--pantanal.console.port "$CONSOLE_PORT")
-        if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" ]]; then
-            _out+=(--pantanal.console.passwordfile "$PANTANAL_CONSOLE_PASSWORD_FILE")
-        fi
-        if [[ -n "${PANTANAL_CONSOLE_ADDR:-}" ]]; then
-            _out+=(--pantanal.console.addr "$PANTANAL_CONSOLE_ADDR")
-        fi
-        log "手机控制台: ${PANTANAL_CONSOLE_ADDR:-127.0.0.1}:${CONSOLE_PORT}"
+    if [[ "$CONSOLE" == off && -z "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" && -z "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
         return 0
     fi
-    if [[ "$CONSOLE" == off ]]; then
-        return 0
-    fi
-    if [[ ! -f "$CONSOLE_PASSWORD_FILE" ]]; then
+    if [[ -z "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" && -z "${PANTANAL_CONSOLE_PASSWORD:-}" && ! -f "$CONSOLE_PASSWORD_FILE" ]]; then
         log "未找到手机控制台口令文件，本次不开启控制台"
         return 0
     fi
     _out+=(--pantanal.console.port "$CONSOLE_PORT")
-    _out+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
-    if [[ "$CONSOLE" == addr && -n "$CONSOLE_ADDR" ]]; then
-        _out+=(--pantanal.console.addr "$CONSOLE_ADDR")
-        log "手机控制台: ${CONSOLE_ADDR}:${CONSOLE_PORT}"
-    else
-        log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
+    _out+=(--pantanal.console.addr "127.0.0.1")
+    if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" ]]; then
+        _out+=(--pantanal.console.passwordfile "$PANTANAL_CONSOLE_PASSWORD_FILE")
+    elif [[ -z "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
+        _out+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
     fi
+    log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
 }
 
 start_geth() {
@@ -643,7 +614,8 @@ Pantanal 公链节点
 数据目录为 ${DATADIR}。同步模式为 full。
 发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
 
-手机控制台口令写入 ${DATADIR}/console.password，权限为仅所有者可读。
+手机控制台只绑定 127.0.0.1:${CONSOLE_PORT}，不接受外网连接。
+口令写入 ${DATADIR}/console.password，权限为仅所有者可读。
 口令不进入命令行，也不写入 geth.log。
 EOF
 }
