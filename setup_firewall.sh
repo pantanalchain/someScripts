@@ -1,63 +1,73 @@
 #!/bin/bash
+# 配合 pantanal.sh 的节点防火墙。
+#
+# pantanal.sh 的对外端口只有 P2P 30303：
+#   TCP 接受其他节点连入，UDP 为发现协议（v4 与 v5 共用这一端口）。
+# 节点还会主动连出到其他节点的 30303，并通过 HTTPS 下载 geth。
+# HTTP RPC 固定为 127.0.0.1:8545。手机控制台启用时为 127.0.0.1:8790。
+#
+# 用法: ADMIN_IP=203.0.113.8 ./setup_firewall.sh
 
-# Pantanal 节点防火墙配置脚本
-# 使用前请根据实际情况修改 ADMIN_IP
+set -euo pipefail
 
-echo "=== Pantanal 节点防火墙配置 ==="
+ADMIN_IP="${ADMIN_IP:-0.0.0.0/0}"
+P2P_PORT=30303
 
-# 设置管理员 IP（修改为你的实际 IP）
-ADMIN_IP="0.0.0.0/0"  # 改为你的 IP，例如：123.45.67.89
+as_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
 
-# 重置 UFW（可选，小心使用）
-# sudo ufw --force reset
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
+    cat <<'EOF'
+用法: ADMIN_IP=203.0.113.8 ./setup_firewall.sh
 
-# 设置默认策略
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
+入口: 22/tcp，30303/tcp，30303/udp
+出口: 放行。节点要连其他节点的 30303，并访问 HTTPS 下载 geth。
+8545 与 8790 由 pantanal.sh 绑在 127.0.0.1，不进入这条规则。
 
-echo "1. 配置 SSH 访问..."
-if [ "$ADMIN_IP" = "0.0.0.0/0" ]; then
-    echo "⚠️  警告：SSH 将开放给所有 IP，建议修改脚本中的 ADMIN_IP 变量"
-    sudo ufw allow 22/tcp
-else
-    echo "✓ SSH 限制为 $ADMIN_IP"
-    sudo ufw allow from $ADMIN_IP to any port 22
+未设置 ADMIN_IP 时，22/tcp 对所有地址开放。
+EOF
+    exit 0
 fi
 
-echo "2. 配置 HTTP/HTTPS（公网访问）..."
-sudo ufw allow 80/tcp comment 'HTTP'
-sudo ufw allow 443/tcp comment 'HTTPS'
-
-echo "3. 配置 Geth P2P（公网访问）..."
-sudo ufw allow 30303/tcp comment 'Geth P2P TCP'
-sudo ufw allow 30303/udp comment 'Geth P2P UDP'
-
-echo "4. 配置 RPC 端口（仅本地）..."
-# 8545 不对外开放，只通过 Nginx 443 访问
-echo "   8545 端口不对外开放（通过 Nginx 443 访问）"
-
-echo ""
-echo "=== 防火墙规则预览 ==="
-sudo ufw show added
-
-echo ""
-read -p "是否启用防火墙？(y/n): " CONFIRM
-
-if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
-    sudo ufw --force enable
-    echo ""
-    echo "✓ 防火墙已启用"
-    echo ""
-    sudo ufw status numbered
-else
-    echo "✗ 已取消，防火墙未启用"
+if ! command -v ufw >/dev/null 2>&1; then
+    echo "未安装 ufw" >&2
+    exit 1
 fi
 
-echo ""
-echo "=== 配置完成 ==="
-echo "如需修改规则："
-echo "  查看规则：sudo ufw status numbered"
-echo "  删除规则：sudo ufw delete <编号>"
-echo "  添加规则：sudo ufw allow <端口>/tcp"
-echo "  禁用防火墙：sudo ufw disable"
+echo "=== Pantanal 节点防火墙 ==="
+echo "入口: 22/tcp, ${P2P_PORT}/tcp, ${P2P_PORT}/udp"
+echo "出口: 放行"
+if [[ "$ADMIN_IP" == "0.0.0.0/0" ]]; then
+    echo "警告: 未设置 ADMIN_IP，22/tcp 对所有地址开放"
+else
+    echo "SSH 仅 $ADMIN_IP"
+fi
+echo
+read -r -p "将清空现有 ufw 规则并启用，确认? (y/n): " CONFIRM
 
+if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+    echo "已取消，未修改防火墙"
+    exit 0
+fi
+
+as_root ufw --force reset
+as_root ufw default deny incoming
+as_root ufw default allow outgoing
+
+if [[ "$ADMIN_IP" == "0.0.0.0/0" ]]; then
+    as_root ufw allow 22/tcp comment 'SSH'
+else
+    as_root ufw allow from "$ADMIN_IP" to any port 22 proto tcp comment 'SSH'
+fi
+
+as_root ufw allow "${P2P_PORT}/tcp" comment 'Geth P2P'
+as_root ufw allow "${P2P_PORT}/udp" comment 'Geth discovery'
+
+as_root ufw --force enable
+echo
+as_root ufw status numbered
