@@ -189,6 +189,17 @@ start_geth() {
     fi
     printf '%s\n' "$gcmode" > "$GCMODE_FILE"
     log "启动 Pantanal 公链节点 (gcmode ${gcmode})"
+    local -a console_args=()
+    if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" || -n "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
+        console_args+=(--pantanal.console.port 8790)
+        if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" ]]; then
+            console_args+=(--pantanal.console.passwordfile "$PANTANAL_CONSOLE_PASSWORD_FILE")
+        fi
+        if [[ -n "${PANTANAL_CONSOLE_ADDR:-}" ]]; then
+            console_args+=(--pantanal.console.addr "$PANTANAL_CONSOLE_ADDR")
+        fi
+        log "手机控制台: ${PANTANAL_CONSOLE_ADDR:-127.0.0.1}:8790"
+    fi
     nohup "$geth" \
         --Pantanal \
         --datadir "$DATADIR" \
@@ -201,6 +212,7 @@ start_geth() {
         --http.api "$HTTP_API" \
         --maxpeers 100 \
         --verbosity 3 \
+        "${console_args[@]}" \
         >> "$LOG_FILE" 2>&1 < /dev/null &
     pid=$!
     printf '%s\n' "$pid" > "$PID_FILE"
@@ -283,6 +295,11 @@ Pantanal 公链节点
 公链参数由 geth --Pantanal 决定：NetworkId 1122、内置创世块、公网 bootnode。
 数据目录为 ${DATADIR}。同步模式为 full。
 发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
+
+手机控制台默认关闭。设置 PANTANAL_CONSOLE_PASSWORD，或把
+PANTANAL_CONSOLE_PASSWORD_FILE 指向仅所有者可读的口令文件后，geth 才监听 8790。
+默认只绑定 127.0.0.1。要对手机开放时再设置 PANTANAL_CONSOLE_ADDR。
+口令不写入命令行，也不写入 geth.log。
 EOF
 }
 
