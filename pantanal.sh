@@ -1,576 +1,319 @@
 #!/bin/bash
+# Pantanal 公链节点安装与管理。
+#
+# 从本仓库最新 Release 下载对应平台的 geth，并以 --Pantanal 启动。
+# --Pantanal 写入 NetworkId 1122、创世块和公网 bootnode，不另放 genesis 文件。
+# 公链同步使用 full；默认 gcmode 为 full，归档节点使用 archive。
 
-# Pantanal 验证节点统一管理脚本
-# 功能：启动、监控、解锁、状态查询等
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_NAME=$(basename "$0")
+RELEASE_BASE="https://github.com/pantanalchain/someScripts/releases/latest/download"
+P2P_PORT=30303
+HTTP_ADDR="127.0.0.1"
+HTTP_PORT=8545
+HTTP_API="eth,net,web3,admin"
 
-# 日志文件
-GETH_LOG="/tmp/geth.log"
-MONITOR_LOG="/tmp/geth_monitor.log"
-UNLOCK_LOG="/tmp/geth_auto_unlock.log"
-GETH_PID_FILE="/tmp/geth.pid"
-PASSWORD_FILE="/root/.pantanal_password"
+if [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]]; then
+    DATADIR="/data/pantanal"
+    BIN_DIR="/usr/local/bin"
+else
+    DATADIR="${HOME}/pantanal/data"
+    BIN_DIR="${HOME}/pantanal/bin"
+fi
 
-# 日志函数
+LOG_FILE="${DATADIR}/geth.log"
+PID_FILE="${DATADIR}/geth.pid"
+GCMODE_FILE="${DATADIR}/gcmode"
+
 log() {
-    local log_file="$1"
-    shift
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$log_file"
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+as_root() {
+    if [[ "$(id -u)" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
 }
 
-# 检查 geth 是否正在运行
-check_geth_running() {
-    if pgrep -f "geth.*Pantanal" > /dev/null; then
-        return 0
+platform_asset() {
+    local os arch
+    os=$(uname -s)
+    arch=$(uname -m)
+    case "$os" in
+        Linux) os=linux ;;
+        Darwin) os=darwin ;;
+        MINGW*|MSYS*|CYGWIN*) os=windows ;;
+        *)
+            log "不支持的系统: $os"
+            return 1
+            ;;
+    esac
+    case "$arch" in
+        x86_64|amd64) arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *)
+            log "不支持的架构: $arch"
+            return 1
+            ;;
+    esac
+    if [[ "$os" == windows ]]; then
+        printf 'geth-%s-%s.zip\n' "$os" "$arch"
+    else
+        printf 'geth-%s-%s.tar.gz\n' "$os" "$arch"
+    fi
+}
+
+geth_path() {
+    if [[ -x "${BIN_DIR}/geth" ]]; then
+        printf '%s\n' "${BIN_DIR}/geth"
+    elif [[ -x "${BIN_DIR}/geth.exe" ]]; then
+        printf '%s\n' "${BIN_DIR}/geth.exe"
     else
         return 1
     fi
 }
 
-# 获取账户地址
-get_account() {
-    local account=$(cd /root/pantanal && ./build/bin/geth --Pantanal account list 2>/dev/null | grep "Account #0" | sed -n 's/.*{\(.*\)}.*/\1/p')
-    
-    if [ -z "$account" ]; then
-        local keystore_file=$(ls -t ~/.ethereum/Pantanal/keystore/ 2>/dev/null | head -1)
-        if [ -n "$keystore_file" ]; then
-            account=$(echo "$keystore_file" | sed -n 's/.*--\(.*\)$/\1/p')
-        fi
+ensure_datadir() {
+    if [[ "$DATADIR" == /data/* ]]; then
+        as_root mkdir -p "$DATADIR"
+        as_root chown "$(id -u):$(id -g)" "$DATADIR"
+    else
+        mkdir -p "$DATADIR"
     fi
-    
-    echo "$account"
 }
 
-# 获取密码（仅从密码文件）
-get_password() {
-    if [ -f "$PASSWORD_FILE" ]; then
-        cat "$PASSWORD_FILE"
-        return 0
+install_geth() {
+    local asset tmp archive bin name dest
+    command -v curl >/dev/null 2>&1 || {
+        log "需要 curl"
+        return 1
+    }
+    asset=$(platform_asset)
+    tmp=$(mktemp -d)
+    archive="${tmp}/${asset}"
+    log "下载最新 geth: ${RELEASE_BASE}/${asset}"
+    curl -fL --retry 3 --retry-delay 2 -o "$archive" "${RELEASE_BASE}/${asset}"
+    case "$asset" in
+        *.tar.gz)
+            tar -xzf "$archive" -C "$tmp"
+            ;;
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -qo "$archive" -d "$tmp"
+            else
+                python3 -m zipfile -e "$archive" "$tmp"
+            fi
+            ;;
+    esac
+    bin=""
+    while IFS= read -r candidate; do
+        bin=$candidate
+        break
+    done < <(find "$tmp" -type f \( -name geth -o -name geth.exe \))
+    if [[ -z "$bin" ]]; then
+        rm -rf "$tmp"
+        log "发布包中没有 geth"
+        return 1
     fi
-    
+    name=$(basename "$bin")
+    dest="${BIN_DIR}/${name}"
+    if [[ -w "$BIN_DIR" || ! -e "$BIN_DIR" && -w "$(dirname "$BIN_DIR")" ]]; then
+        mkdir -p "$BIN_DIR"
+        cp "$bin" "$dest"
+        chmod 755 "$dest"
+    else
+        as_root mkdir -p "$BIN_DIR"
+        as_root cp "$bin" "$dest"
+        as_root chmod 755 "$dest"
+    fi
+    rm -rf "$tmp"
+    log "已安装 $($dest version | awk 'NR==1{print} NR==2{print}')"
+    log "路径: $dest"
+}
+
+running_pid() {
+    if [[ -f "$PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
     return 1
 }
 
-# 编译 geth
-compile_geth() {
-    log_info "正在重新编译 geth..."
-    if [ ! -d "/root/pantanal" ]; then
-        log_info "✗ 错误: 未找到 /root/pantanal 目录"
-        log_info "请先克隆代码: git clone https://github.com/pantanalchain/pantanal.git /root/pantanal"
-        return 1
-    fi
-    
-    cd /root/pantanal
-    if ! make geth; then
-        log_info "✗ 编译失败"
-        return 1
-    fi
-    
-    export PATH=$PATH:/root/pantanal/build/bin
-    log_info "✓ geth 编译完成"
-    return 0
-}
-
-# 检查并创建账户
-check_account() {
-    if [ ! -d "$HOME/.ethereum/Pantanal/keystore" ] || [ -z "$(ls -A $HOME/.ethereum/Pantanal/keystore 2>/dev/null)" ]; then
-        log_info ""
-        log_info "⚠ 未找到账户"
-        log_info "请选择："
-        log_info "  1) 导入已有私钥"
-        log_info "  2) 创建新账户"
-        log_info "  3) 退出"
-        read -p "请输入选项 [1-3]: " CHOICE
-        
-        case $CHOICE in
-            1)
-                log_info ""
-                log_info "=== 导入私钥 ==="
-                log_info "⚠ 注意：私钥输入不会显示在屏幕上"
-                read -s -p "请输入私钥（不带 0x 前缀）：" PRIVATE_KEY
-                echo ""
-                
-                if [ -z "$PRIVATE_KEY" ]; then
-                    log_info "✗ 私钥不能为空"
-                    return 1
-                fi
-                
-                echo "$PRIVATE_KEY" > /tmp/privkey_temp.txt
-                log_info ""
-                log_info "请设置账户密码："
-                geth --Pantanal account import /tmp/privkey_temp.txt
-                shred -u /tmp/privkey_temp.txt
-                log_info "✓ 账户导入成功"
-                ;;
-            2)
-                log_info ""
-                log_info "=== 创建新账户 ==="
-                geth --Pantanal account new
-                log_info "✓ 账户创建成功"
-                log_info "⚠ 请妥善保管好私钥和密码！"
-                ;;
-            3)
-                log_info "退出"
-                exit 0
-                ;;
-            *)
-                log_info "✗ 无效选项"
-                return 1
-                ;;
-        esac
-        
-        log_info ""
-        log_info "账户已准备就绪，继续启动节点..."
-        sleep 2
-    fi
-    return 0
-}
-
-# 启动 geth（仅启动，不处理解锁和挖矿）
-start_geth_only() {
-    log_info "启动 Pantanal 节点..."
-    
-    # 检查 geth 二进制文件
-    if [ ! -f "/root/pantanal/build/bin/geth" ]; then
-        log_info "错误: 未找到 geth 二进制文件，正在编译..."
-        if ! compile_geth; then
-            return 1
-        fi
-    fi
-    
-    # 检查账户
-    if [ ! -d "$HOME/.ethereum/Pantanal/keystore" ] || [ -z "$(ls -A $HOME/.ethereum/Pantanal/keystore 2>/dev/null)" ]; then
-        log_info "错误: 未找到账户"
-        return 1
-    fi
-    
-    cd /root/pantanal
-    
-    # 获取账户地址用于自动解锁
-    local account=$(get_account)
-    local unlock_param=""
-    if [ -n "$account" ] && [ -f "$PASSWORD_FILE" ]; then
-        # 使用密码文件路径，geth 会自动读取
-        unlock_param="--unlock 0x$account --password $PASSWORD_FILE"
-    fi
-    
-    # 使用 setsid 确保 geth 完全独立运行
-    setsid ./build/bin/geth \
-        --Pantanal \
-        --port 30303 \
-        --http \
-        --http.addr 0.0.0.0 \
-        --http.port 8545 \
-        --http.api "eth,net,web3,admin,clique,miner,personal,txpool,debug,trace" \
-        --http.corsdomain "*" \
-        --http.vhosts "*" \
-        --allow-insecure-unlock \
-        $unlock_param \
-        --ws \
-        --ws.addr 0.0.0.0 \
-        --ws.port 8545 \
-        --ws.api "eth,net,web3,admin,clique,miner,personal,txpool,debug,trace" \
-        --ws.origins "*" \
-        --maxpeers=100 \
-        --syncmode full \
-        --gcmode archive \
-        --verbosity 3 \
-        > "$GETH_LOG" 2>&1 < /dev/null &
-    
-    local geth_pid=$!
-    disown $geth_pid 2>/dev/null || true
-    echo $geth_pid > "$GETH_PID_FILE"
-    
-    # 等待启动
-    sleep 5
-    
-    if check_geth_running; then
-        log_info "✓ Geth 已启动 (PID: $geth_pid)"
-        return 0
-    else
-        log_info "✗ geth 启动失败，查看日志: tail -f $GETH_LOG"
-        return 1
-    fi
-}
-
-# 解锁账户并启动挖矿
-unlock_and_mine() {
-    if ! check_geth_running; then
-        log "$UNLOCK_LOG" "错误: geth 未运行，无法解锁"
-        return 1
-    fi
-    
-    local account=$(get_account)
-    if [ -z "$account" ]; then
-        log "$UNLOCK_LOG" "错误: 无法获取账户地址"
-        return 1
-    fi
-    
-    local password=$(get_password)
-    if [ -z "$password" ]; then
-        log "$UNLOCK_LOG" "错误: 未找到密码文件"
-        log "$UNLOCK_LOG" "请设置密码文件: echo 'your_password' > $PASSWORD_FILE && chmod 600 $PASSWORD_FILE"
-        return 1
-    fi
-    
-    log "$UNLOCK_LOG" "正在解锁账户 0x$account 并启动挖矿..."
-    
-    # 等待 RPC 接口就绪
-    sleep 3
-    
-    # 检查是否已经解锁
-    local unlocked=$(curl -s -X POST http://127.0.0.1:8545 \
-        -H "Content-Type: application/json" \
-        -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_accounts\",\"params\":[],\"id\":1}" | grep -o "\"0x$account\"" || echo "")
-    
-    local unlock_success=0
-    if [ -z "$unlocked" ]; then
-        # 解锁账户
-        local unlock_result=$(cd /root/pantanal && ./build/bin/geth attach http://127.0.0.1:8545 <<EOF 2>&1
-personal.unlockAccount("0x$account", "$password", 0)
-exit
-EOF
-)
-        
-        if echo "$unlock_result" | grep -q "true"; then
-            log "$UNLOCK_LOG" "✓ 账户解锁成功"
-            unlock_success=1
-        else
-            log "$UNLOCK_LOG" "✗ 账户解锁失败: $unlock_result"
-            return 1
-        fi
-    else
-        log "$UNLOCK_LOG" "账户已解锁，检查挖矿状态..."
-        unlock_success=1
-    fi
-    
-    # 检查挖矿状态
-    local mining_status=$(curl -s -X POST http://127.0.0.1:8545 \
-        -H "Content-Type: application/json" \
-        -d '{"jsonrpc":"2.0","method":"eth_mining","params":[],"id":1}' 2>/dev/null | grep -o '"result":[^,}]*' | cut -d: -f2 | tr -d ' ')
-    
-    if [ "$mining_status" = "true" ]; then
-        log "$UNLOCK_LOG" "✓ 挖矿已在运行"
+stop_geth() {
+    local pid
+    if ! pid=$(running_pid); then
+        log "geth 未运行"
+        rm -f "$PID_FILE"
         return 0
     fi
-    
-    # 启动挖矿
-    log "$UNLOCK_LOG" "正在启动挖矿..."
-    cd /root/pantanal && ./build/bin/geth attach http://127.0.0.1:8545 <<EOF 2>&1
-miner.start()
-exit
-EOF
-    
-    # 等待挖矿启动
-    sleep 3
-    
-    # 验证挖矿是否启动（多次检查，确保准确性）
-    local check_count=0
-    local max_checks=5
-    while [ $check_count -lt $max_checks ]; do
-        mining_status=$(curl -s -X POST http://127.0.0.1:8545 \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","method":"eth_mining","params":[],"id":1}' 2>/dev/null | grep -o '"result":[^,}]*' | cut -d: -f2 | tr -d ' ')
-        
-        if [ "$mining_status" = "true" ]; then
-            log "$UNLOCK_LOG" "✓ 挖矿启动成功"
+    log "正在停止 geth (PID ${pid})"
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in 1 2 3 4 5; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PID_FILE"
+            log "geth 已停止"
             return 0
         fi
-        
-        check_count=$((check_count + 1))
-        if [ $check_count -lt $max_checks ]; then
-            sleep 1
-        fi
+        sleep 1
     done
-    
-    # 如果多次检查都失败，尝试通过 geth attach 直接检查
-    local direct_check=$(cd /root/pantanal && ./build/bin/geth attach http://127.0.0.1:8545 <<EOF 2>&1 | grep -i "true\|false" | head -1
-eth.mining
-exit
-EOF
-)
-    
-    if echo "$direct_check" | grep -qi "true"; then
-        log "$UNLOCK_LOG" "✓ 挖矿启动成功（通过直接检查确认）"
-        return 0
-    else
-        log "$UNLOCK_LOG" "⚠ 挖矿可能未启动"
-        # 如果解锁成功，返回2表示解锁成功但挖矿失败
-        if [ "$unlock_success" = "1" ]; then
-            return 2
-        else
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    log "geth 已强制停止"
+}
+
+start_geth() {
+    local gcmode="${1:-full}"
+    local geth pid
+    case "$gcmode" in
+        full|archive) ;;
+        *)
+            log "gcmode 只能是 full 或 archive"
             return 1
-        fi
+            ;;
+    esac
+    if ! geth=$(geth_path); then
+        install_geth
+        geth=$(geth_path)
     fi
+    ensure_datadir
+    if pid=$(running_pid); then
+        log "geth 已在运行 (PID ${pid})"
+        return 0
+    fi
+    printf '%s\n' "$gcmode" > "$GCMODE_FILE"
+    log "启动 Pantanal 公链节点 (gcmode ${gcmode})"
+    nohup "$geth" \
+        --Pantanal \
+        --datadir "$DATADIR" \
+        --port "$P2P_PORT" \
+        --syncmode full \
+        --gcmode "$gcmode" \
+        --http \
+        --http.addr "$HTTP_ADDR" \
+        --http.port "$HTTP_PORT" \
+        --http.api "$HTTP_API" \
+        --maxpeers 100 \
+        --verbosity 3 \
+        >> "$LOG_FILE" 2>&1 < /dev/null &
+    pid=$!
+    printf '%s\n' "$pid" > "$PID_FILE"
+    disown "$pid" 2>/dev/null || true
+    sleep 3
+    if kill -0 "$pid" 2>/dev/null; then
+        log "geth 已启动 (PID ${pid})"
+        log "数据目录: ${DATADIR}"
+        log "P2P: ${P2P_PORT}"
+        log "HTTP: http://${HTTP_ADDR}:${HTTP_PORT}"
+        log "日志: ${LOG_FILE}"
+        return 0
+    fi
+    log "geth 启动失败，查看日志: ${LOG_FILE}"
+    return 1
 }
 
-# 完整启动流程（编译、检查账户、启动、解锁挖矿）
-start_full() {
-    log_info "=== Pantanal 验证节点启动脚本 ==="
-    
-    # 1. 编译
-    if ! compile_geth; then
-        return 1
-    fi
-    
-    # 2. 检查账户
-    if ! check_account; then
-        return 1
-    fi
-    
-    # 3. 获取账户地址
-    local account=$(get_account)
-    if [ -z "$account" ]; then
-        log_info "✗ 无法获取账户地址"
-        return 1
-    fi
-    log_info "✓ 账户地址: 0x$account"
-    
-    # 4. 停止已运行的 geth
-    if check_geth_running; then
-        log_info "⚠ 检测到 geth 正在运行，正在停止..."
-        pkill -f "geth.*Pantanal"
-        sleep 3
-    fi
-    
-    # 5. 检查密码文件，如果不存在则创建
-    if [ ! -f "$PASSWORD_FILE" ] && [ -t 0 ]; then
-        log_info ""
-        log_info "⚠ 未找到密码文件，需要创建密码文件以支持自动解锁和挖矿"
-        log_info "请输入账户密码（账户地址: 0x$account）："
-        read -s password_input
-        echo ""
-        
-        if [ -z "$password_input" ]; then
-            log_info "✗ 密码不能为空"
-            log_info "请稍后手动创建密码文件: echo 'your_password' > $PASSWORD_FILE && chmod 600 $PASSWORD_FILE"
-        else
-            echo "$password_input" > "$PASSWORD_FILE"
-            chmod 600 "$PASSWORD_FILE"
-            log_info "✓ 密码文件已创建: $PASSWORD_FILE"
-        fi
-    fi
-    
-    # 6. 启动 geth
-    if ! start_geth_only; then
-        return 1
-    fi
-    
-    # 7. 解锁并启动挖矿
-    unlock_and_mine
-    local unlock_result=$?
-    
-    if [ $unlock_result -eq 0 ]; then
-        # 完全成功（解锁+挖矿）
-        log_info "✓ 账户已解锁，挖矿已启动"
-    elif [ $unlock_result -eq 2 ]; then
-        # 解锁成功但挖矿失败
-        log_info "✓ 账户已解锁，但挖矿启动失败"
-        log_info "  可以稍后手动启动挖矿: ./pantanal.sh unlock"
-    else
-        # 解锁失败
-        log_info "⚠ geth 已启动，但解锁失败"
-        log_info ""
-        log_info "提示：请配置密码文件以支持自动解锁和挖矿："
-        log_info "  echo 'your_password' > $PASSWORD_FILE && chmod 600 $PASSWORD_FILE"
-        log_info ""
-        log_info "或者手动解锁: ./pantanal.sh unlock"
-    fi
-    
-    log_info ""
-    log_info "=== 验证节点已启动 ==="
-    log_info "HTTP JSON-RPC:     http://0.0.0.0:8545"
-    log_info "WebSocket:         ws://0.0.0.0:8545"
-    log_info "P2P Port:          30303"
-    log_info ""
-    log_info "日志文件: $GETH_LOG"
-    log_info "查看日志: tail -f $GETH_LOG"
-    log_info "停止节点: $SCRIPT_NAME stop"
-    log_info "连接到控制台: geth --Pantanal attach"
+install_node() {
+    local gcmode="${1:-full}"
+    stop_geth || true
+    install_geth
+    start_geth "$gcmode"
 }
 
-# 监控模式（检查并自动启动、解锁、挖矿）
-monitor() {
-    if check_geth_running; then
-        local current_pid=$(pgrep -f "geth.*Pantanal" | head -1)
-        if [ -n "$current_pid" ]; then
-            echo $current_pid > "$GETH_PID_FILE"
-        fi
-        log "$MONITOR_LOG" "✓ Geth 运行正常 (PID: $current_pid)"
-        
-        # 检查是否需要解锁和挖矿
-        local account=$(get_account)
-        if [ -n "$account" ]; then
-            # 检查挖矿状态
-            local mining_status=$(curl -s -X POST http://127.0.0.1:8545 \
-                -H "Content-Type: application/json" \
-                -d '{"jsonrpc":"2.0","method":"eth_mining","params":[],"id":1}' 2>/dev/null | grep -o '"result":[^,}]*' | cut -d: -f2 | tr -d ' ')
-            
-            if [ "$mining_status" != "true" ]; then
-                log "$MONITOR_LOG" "⚠ 挖矿未运行，尝试解锁并启动挖矿..."
-                if unlock_and_mine; then
-                    log "$MONITOR_LOG" "✓ 解锁并启动挖矿成功"
-                else
-                    log "$MONITOR_LOG" "✗ 解锁或启动挖矿失败（需要配置密码文件）"
-                    log "$MONITOR_LOG" "   配置方法: echo 'your_password' > $PASSWORD_FILE && chmod 600 $PASSWORD_FILE"
-                fi
-            else
-                log "$MONITOR_LOG" "✓ 挖矿运行正常"
-            fi
-        fi
-    else
-        log "$MONITOR_LOG" "⚠ Geth 未运行，正在启动..."
-        if start_geth_only; then
-            log "$MONITOR_LOG" "✓ Geth 启动成功"
-            
-            # 等待 geth 完全启动
-            sleep 5
-            
-            # 尝试解锁并启动挖矿
-            log "$MONITOR_LOG" "正在尝试解锁账户并启动挖矿..."
-            if unlock_and_mine; then
-                log "$MONITOR_LOG" "✓ 解锁并启动挖矿成功"
-            else
-                log "$MONITOR_LOG" "✗ 解锁或启动挖矿失败（需要配置密码文件）"
-                log "$MONITOR_LOG" "   配置方法: echo 'your_password' > $PASSWORD_FILE && chmod 600 $PASSWORD_FILE"
-            fi
-        else
-            log "$MONITOR_LOG" "✗ Geth 启动失败"
-        fi
-    fi
-}
-
-# 显示状态
 show_status() {
-    log_info "=== Pantanal Geth 状态 ==="
-    
-    if check_geth_running; then
-        local pid=$(pgrep -f "geth.*Pantanal" | head -1)
-        log_info "✓ Geth 正在运行 (PID: $pid)"
-        
-        # 检查挖矿状态
-        local mining=$(curl -s -X POST http://127.0.0.1:8545 \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","method":"eth_mining","params":[],"id":1}' 2>/dev/null | grep -o '"result":[^,}]*' | cut -d: -f2 | tr -d ' ')
-        
-        if [ "$mining" = "true" ]; then
-            log_info "✓ 挖矿: 运行中"
-        else
-            log_info "⚠ 挖矿: 未运行"
-        fi
-        
-        # 获取区块高度
-        local block=$(curl -s -X POST http://127.0.0.1:8545 \
-            -H "Content-Type: application/json" \
-            -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null | grep -o '"result":"[^"]*"' | cut -d'"' -f4)
-        
-        if [ -n "$block" ]; then
-            local block_num=$((16#${block#0x}))
-            log_info "当前区块: $block_num"
-        fi
-        
-        local account=$(get_account)
-        if [ -n "$account" ]; then
-            log_info "账户地址: 0x$account"
-        fi
+    local pid block chain
+    log "=== Pantanal geth ==="
+    if pid=$(running_pid); then
+        log "运行中 (PID ${pid})"
     else
-        log_info "✗ Geth 未运行"
+        log "未运行"
     fi
-    
-    log_info ""
-    log_info "日志文件:"
-    log_info "  - Geth: $GETH_LOG"
-    log_info "  - 监控: $MONITOR_LOG"
-    log_info "  - 解锁: $UNLOCK_LOG"
+    if [[ -f "$GCMODE_FILE" ]]; then
+        log "gcmode: $(cat "$GCMODE_FILE")"
+    fi
+    chain=$(curl -fsS -m 3 -X POST "http://${HTTP_ADDR}:${HTTP_PORT}" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}' 2>/dev/null || true)
+    block=$(curl -fsS -m 3 -X POST "http://${HTTP_ADDR}:${HTTP_PORT}" \
+        -H 'Content-Type: application/json' \
+        -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null || true)
+    if [[ -n "$chain" ]]; then
+        log "chainId: ${chain}"
+    fi
+    if [[ -n "$block" ]]; then
+        log "区块: ${block}"
+    fi
+    log "数据目录: ${DATADIR}"
+    log "日志: ${LOG_FILE}"
 }
 
-# 停止 geth
-stop_geth() {
-    if check_geth_running; then
-        log_info "正在停止 geth..."
-        pkill -f "geth.*Pantanal"
-        sleep 2
-        if check_geth_running; then
-            log_info "✗ 停止失败，尝试强制停止..."
-            pkill -9 -f "geth.*Pantanal"
-        else
-            log_info "✓ Geth 已停止"
-        fi
-    else
-        log_info "Geth 未运行"
+monitor() {
+    local gcmode=full
+    if [[ -f "$GCMODE_FILE" ]]; then
+        gcmode=$(cat "$GCMODE_FILE")
     fi
+    if running_pid >/dev/null; then
+        log "geth 运行正常 (PID $(running_pid))"
+        return 0
+    fi
+    log "geth 未运行，正在启动"
+    start_geth "$gcmode"
 }
 
-# 显示帮助信息
 show_help() {
     cat <<EOF
-Pantanal 验证节点统一管理脚本
+Pantanal 公链节点
 
-用法: $SCRIPT_NAME <command> [options]
+用法: $(basename "$0") <command>
 
-命令:
-  start       完整启动（编译、检查账户、启动geth、解锁挖矿）
-  monitor     监控模式（检查geth是否运行，未运行则自动启动并解锁挖矿）
-  unlock      解锁账户并启动挖矿（需要geth已运行）
-  status      显示geth运行状态
-  stop        停止geth
-  help        显示此帮助信息
+  install [archive]   下载最新 geth 并启动。archive 使用 --gcmode archive
+  start [archive]     启动已安装的节点；没有二进制时先下载
+  stop                停止节点
+  status              查看进程和链 ID
+  monitor             进程退出后按上次的 gcmode 拉起
+  help                显示此说明
 
-示例:
-  $SCRIPT_NAME start          # 完整启动节点
-  $SCRIPT_NAME monitor        # 监控模式（通常用于cron）
-  $SCRIPT_NAME unlock         # 解锁账户并启动挖矿
-  $SCRIPT_NAME status         # 查看状态
-  $SCRIPT_NAME stop           # 停止节点
+直接执行本脚本等同于 install。
 
-密码文件配置:
-  echo "your_password" > $PASSWORD_FILE
-  chmod 600 $PASSWORD_FILE
-
-Cron 监控设置:
-  * * * * * $SCRIPT_NAME monitor >> $MONITOR_LOG 2>&1
-
+公链参数由 geth --Pantanal 决定：NetworkId 1122、内置创世块、公网 bootnode。
+数据目录为 ${DATADIR}。同步模式为 full。
+发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
 EOF
 }
 
-# 主函数
 main() {
-    local command="${1:-help}"
-    
+    local command="${1:-install}"
+    local mode="${2:-full}"
     case "$command" in
+        install)
+            install_node "$mode"
+            ;;
         start)
-            start_full
+            start_geth "$mode"
             ;;
-        monitor)
-            monitor
-            ;;
-        unlock)
-            unlock_and_mine
+        stop)
+            stop_geth
             ;;
         status)
             show_status
             ;;
-        stop)
-            stop_geth
+        monitor)
+            monitor
             ;;
         help|--help|-h)
             show_help
             ;;
         *)
-            log_info "未知命令: $command"
-            echo ""
+            log "未知命令: $command"
             show_help
-            exit 1
+            return 1
             ;;
     esac
 }
 
-# 执行主函数
 main "$@"
-
