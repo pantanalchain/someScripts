@@ -25,13 +25,11 @@ fi
 
 LOG_FILE="${DATADIR}/geth.log"
 PID_FILE="${DATADIR}/geth.pid"
-GCMODE_FILE="${DATADIR}/gcmode"
 STAMP_FILE="${DATADIR}/geth.release"
 NODE_CONF="${DATADIR}/node.conf"
 GETH_UPDATED=0
 GCMODE=full
 CONSOLE=off
-CONSOLE_ADDR="127.0.0.1"
 CONSOLE_PASSWORD_FILE=""
 
 log() {
@@ -144,9 +142,7 @@ ensure_datadir() {
 load_node_conf() {
     GCMODE=full
     CONSOLE=off
-    CONSOLE_ADDR="127.0.0.1"
     CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
-    [[ -f "$GCMODE_FILE" ]] && GCMODE=$(cat "$GCMODE_FILE")
     [[ -f "$NODE_CONF" ]] || return 0
     local key value
     while IFS='=' read -r key value; do
@@ -157,11 +153,7 @@ load_node_conf() {
         esac
     done < "$NODE_CONF"
     [[ "$GCMODE" == archive ]] || GCMODE=full
-    # 旧配置里的外网地址不再使用。控制台只绑定本机。
-    if [[ "$CONSOLE" != off ]]; then
-        CONSOLE=local
-    fi
-    CONSOLE_ADDR="127.0.0.1"
+    [[ "$CONSOLE" == local ]] || CONSOLE=off
 }
 
 save_node_conf() {
@@ -170,11 +162,9 @@ save_node_conf() {
     cat > "$NODE_CONF" <<EOF
 GCMODE=${GCMODE}
 CONSOLE=${CONSOLE}
-CONSOLE_ADDR=${CONSOLE_ADDR}
 CONSOLE_PASSWORD_FILE=${CONSOLE_PASSWORD_FILE}
 EOF
     chmod 600 "$NODE_CONF"
-    printf '%s\n' "$GCMODE" > "$GCMODE_FILE"
 }
 
 save_console_password() {
@@ -207,13 +197,11 @@ choose_console() {
         "只监听 127.0.0.1:${CONSOLE_PORT}")
     if [[ "$choice" == 2 ]]; then
         CONSOLE=local
-        CONSOLE_ADDR="127.0.0.1"
         save_console_password
         log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
         return 0
     fi
     CONSOLE=off
-    CONSOLE_ADDR="127.0.0.1"
     log "手机控制台: 不开启"
 }
 
@@ -371,20 +359,16 @@ stop_geth() {
 console_args() {
     local -n _out=$1
     _out=()
-    if [[ "$CONSOLE" == off && -z "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" && -z "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
+    if [[ "$CONSOLE" != local ]]; then
         return 0
     fi
-    if [[ -z "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" && -z "${PANTANAL_CONSOLE_PASSWORD:-}" && ! -f "$CONSOLE_PASSWORD_FILE" ]]; then
+    if [[ ! -f "$CONSOLE_PASSWORD_FILE" ]]; then
         log "未找到手机控制台口令文件，本次不开启控制台"
         return 0
     fi
     _out+=(--pantanal.console.port "$CONSOLE_PORT")
     _out+=(--pantanal.console.addr "127.0.0.1")
-    if [[ -n "${PANTANAL_CONSOLE_PASSWORD_FILE:-}" ]]; then
-        _out+=(--pantanal.console.passwordfile "$PANTANAL_CONSOLE_PASSWORD_FILE")
-    elif [[ -z "${PANTANAL_CONSOLE_PASSWORD:-}" ]]; then
-        _out+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
-    fi
+    _out+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
     log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
 }
 
