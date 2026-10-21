@@ -1,35 +1,25 @@
 #!/bin/bash
 # Pantanal 公链节点安装与管理。
 #
-# 直接运行时逐步选择状态模式和手机控制台。
+# 直接运行时选择状态模式，并设置手机控制台口令。
 # 发现更新的 Release 时覆盖已安装的 geth，并重启节点。
 # --Pantanal 写入 NetworkId 1122、创世块和公网 bootnode。同步模式为 full。
+# 按本机系统选择目录、发布包和防火墙：Ubuntu、Debian、Fedora、RHEL、macOS、Windows。
 
 set -euo pipefail
 
 RELEASE_BASE="https://github.com/pantanalchain/someScripts/releases/latest/download"
 RELEASE_API="https://api.github.com/repos/pantanalchain/someScripts/releases/latest"
+FIREWALL_URL="https://pantanalchain.github.io/someScripts/setup_firewall.sh"
 P2P_PORT=30303
 HTTP_ADDR="127.0.0.1"
 HTTP_PORT=8545
 HTTP_API="eth,net,web3,admin"
 CONSOLE_PORT=8790
 
-if [[ "$(uname -s)" == Linux || "$(uname -s)" == Darwin ]]; then
-    DATADIR="/data/pantanal"
-    BIN_DIR="/usr/local/bin"
-else
-    DATADIR="${HOME}/pantanal/data"
-    BIN_DIR="${HOME}/pantanal/bin"
-fi
-
-LOG_FILE="${DATADIR}/geth.log"
-PID_FILE="${DATADIR}/geth.pid"
-STAMP_FILE="${DATADIR}/geth.release"
-NODE_CONF="${DATADIR}/node.conf"
 GETH_UPDATED=0
 GCMODE=full
-CONSOLE=off
+CONSOLE=local
 CONSOLE_PASSWORD_FILE=""
 
 log() {
@@ -37,11 +27,94 @@ log() {
 }
 
 as_root() {
+    if [[ "${OS_FAMILY:-}" == windows ]]; then
+        "$@"
+        return
+    fi
     if [[ "$(id -u)" -eq 0 ]]; then
         "$@"
-    else
+    elif command -v sudo >/dev/null 2>&1; then
         sudo "$@"
+    else
+        "$@"
     fi
+}
+
+detect_platform() {
+    local uname_s uname_m id like
+    uname_s=$(uname -s)
+    uname_m=$(uname -m)
+    case "$uname_m" in
+        x86_64|amd64) ARCH=amd64 ;;
+        aarch64|arm64) ARCH=arm64 ;;
+        *)
+            log "不支持的架构: $uname_m"
+            return 1
+            ;;
+    esac
+    case "$uname_s" in
+        Darwin)
+            OS_FAMILY=macos
+            OS_ID=macos
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            OS_FAMILY=windows
+            OS_ID=windows
+            ;;
+        Linux)
+            OS_FAMILY=linux
+            id=linux
+            like=""
+            if [[ -r /etc/os-release ]]; then
+                id=$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2; exit}' /etc/os-release)
+                like=$(awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print $2; exit}' /etc/os-release)
+            fi
+            case "$id" in
+                ubuntu) OS_ID=ubuntu ;;
+                debian|linuxmint|pop|elementary|kali|raspbian) OS_ID=debian ;;
+                fedora) OS_ID=fedora ;;
+                rhel|centos|rocky|almalinux|ol|amzn) OS_ID=rhel ;;
+                opensuse*|sles|sled) OS_ID=opensuse ;;
+                arch|manjaro|endeavouros) OS_ID=arch ;;
+                *)
+                    case " $like " in
+                        *" ubuntu "*|*" debian "*) OS_ID=debian ;;
+                        *" fedora "*|*" rhel "*) OS_ID=rhel ;;
+                        *" suse "*|*" opensuse "*) OS_ID=opensuse ;;
+                        *" arch "*) OS_ID=arch ;;
+                        *) OS_ID=linux ;;
+                    esac
+                    ;;
+            esac
+            ;;
+        *)
+            log "不支持的系统: $uname_s"
+            return 1
+            ;;
+    esac
+    case "$OS_FAMILY" in
+        linux)
+            DATADIR="/data/pantanal"
+            BIN_DIR="/usr/local/bin"
+            ;;
+        macos)
+            DATADIR="${HOME}/pantanal/data"
+            if [[ -d /opt/homebrew/bin ]]; then
+                BIN_DIR="/opt/homebrew/bin"
+            else
+                BIN_DIR="/usr/local/bin"
+            fi
+            ;;
+        windows)
+            DATADIR="${HOME}/pantanal/data"
+            BIN_DIR="${HOME}/pantanal/bin"
+            ;;
+    esac
+    LOG_FILE="${DATADIR}/geth.log"
+    PID_FILE="${DATADIR}/geth.pid"
+    STAMP_FILE="${DATADIR}/geth.release"
+    NODE_CONF="${DATADIR}/node.conf"
+    log "系统: ${OS_ID} ${ARCH}"
 }
 
 have_tty() {
@@ -76,40 +149,26 @@ prompt_secret() {
         printf '\n请再次输入: ' >/dev/tty
         IFS= read -rs second </dev/tty || return 1
         printf '\n' >/dev/tty
-        if [[ -n "$first" && "$first" == "$second" ]]; then
+        if [[ ${#first} -ge 8 && "$first" == "$second" ]]; then
             printf '%s' "$first"
             return 0
         fi
-        printf '两次输入不一致，或口令为空\n' >/dev/tty
+        printf '两次输入不一致，或口令少于 8 个字符\n' >/dev/tty
     done
 }
 
 platform_asset() {
-    local os arch
-    os=$(uname -s)
-    arch=$(uname -m)
-    case "$os" in
-        Linux) os=linux ;;
-        Darwin) os=darwin ;;
-        MINGW*|MSYS*|CYGWIN*) os=windows ;;
+    local os ext
+    case "$OS_FAMILY" in
+        linux) os=linux; ext=tar.gz ;;
+        macos) os=darwin; ext=tar.gz ;;
+        windows) os=windows; ext=zip ;;
         *)
-            log "不支持的系统: $os"
+            log "不支持的系统: ${OS_FAMILY}"
             return 1
             ;;
     esac
-    case "$arch" in
-        x86_64|amd64) arch=amd64 ;;
-        aarch64|arm64) arch=arm64 ;;
-        *)
-            log "不支持的架构: $arch"
-            return 1
-            ;;
-    esac
-    if [[ "$os" == windows ]]; then
-        printf 'geth-%s-%s.zip\n' "$os" "$arch"
-    else
-        printf 'geth-%s-%s.tar.gz\n' "$os" "$arch"
-    fi
+    printf 'geth-%s-%s.%s\n' "$os" "$ARCH" "$ext"
 }
 
 geth_path() {
@@ -141,7 +200,7 @@ ensure_datadir() {
 
 load_node_conf() {
     GCMODE=full
-    CONSOLE=off
+    CONSOLE=local
     CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
     [[ -f "$NODE_CONF" ]] || return 0
     local key value
@@ -153,7 +212,7 @@ load_node_conf() {
         esac
     done < "$NODE_CONF"
     [[ "$GCMODE" == archive ]] || GCMODE=full
-    [[ "$CONSOLE" == local ]] || CONSOLE=off
+    CONSOLE=local
 }
 
 save_node_conf() {
@@ -167,14 +226,56 @@ EOF
     chmod 600 "$NODE_CONF"
 }
 
-save_console_password() {
-    local secret
-    secret=$(prompt_secret "手机控制台口令: ")
+console_password_mode() {
+    if [[ "$OS_FAMILY" == macos ]]; then
+        stat -f '%OLp' "$CONSOLE_PASSWORD_FILE" 2>/dev/null || true
+    else
+        stat -c '%a' "$CONSOLE_PASSWORD_FILE" 2>/dev/null || true
+    fi
+}
+
+console_password_ok() {
+    local mode secret
+    [[ -f "$CONSOLE_PASSWORD_FILE" ]] || return 1
+    mode=$(console_password_mode)
+    [[ "$mode" == "600" ]] || return 1
+    IFS= read -r secret < "$CONSOLE_PASSWORD_FILE" || return 1
+    [[ ${#secret} -ge 8 ]]
+}
+
+write_console_password() {
+    local secret="$1"
     ensure_datadir
     CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
     umask 077
     printf '%s\n' "$secret" > "$CONSOLE_PASSWORD_FILE"
     chmod 600 "$CONSOLE_PASSWORD_FILE"
+}
+
+save_console_password() {
+    local secret
+    secret=$(prompt_secret "手机控制台口令（至少 8 位）: ") || return 1
+    [[ ${#secret} -ge 8 ]] || return 1
+    write_console_password "$secret"
+}
+
+ensure_console_password() {
+    CONSOLE=local
+    CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
+    if console_password_ok; then
+        return 0
+    fi
+    local env_secret="${PANTANAL_CONSOLE_PASSWORD:-}"
+    if [[ ${#env_secret} -ge 8 ]]; then
+        write_console_password "$env_secret"
+        return 0
+    fi
+    if have_tty; then
+        save_console_password || return 1
+        return 0
+    fi
+    log "部署节点必须设置手机控制台口令。在终端中输入，或提供至少 8 位的 PANTANAL_CONSOLE_PASSWORD。口令写入 ${CONSOLE_PASSWORD_FILE}，不进入命令行。"
+    return 1
 }
 
 choose_gcmode() {
@@ -190,19 +291,11 @@ choose_gcmode() {
     log "状态模式: ${GCMODE}"
 }
 
-choose_console() {
-    local choice
-    choice=$(prompt_choice "手机控制台（只绑定本机，不对外网开放）" \
-        "不开启" \
-        "只监听 127.0.0.1:${CONSOLE_PORT}")
-    if [[ "$choice" == 2 ]]; then
-        CONSOLE=local
-        save_console_password
-        log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
-        return 0
-    fi
-    CONSOLE=off
-    log "手机控制台: 不开启"
+require_console_password() {
+    CONSOLE=local
+    CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
+    save_console_password
+    log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
 }
 
 remote_asset_meta() {
@@ -357,18 +450,14 @@ stop_geth() {
 }
 
 console_args() {
-    local -n _out=$1
-    _out=()
-    if [[ "$CONSOLE" != local ]]; then
-        return 0
+    CONSOLE_ARGS=()
+    if ! console_password_ok; then
+        log "手机控制台口令文件不可用。文件必须仅所有者可读，口令至少 8 个字符。"
+        return 1
     fi
-    if [[ ! -f "$CONSOLE_PASSWORD_FILE" ]]; then
-        log "未找到手机控制台口令文件，本次不开启控制台"
-        return 0
-    fi
-    _out+=(--pantanal.console.port "$CONSOLE_PORT")
-    _out+=(--pantanal.console.addr "127.0.0.1")
-    _out+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
+    CONSOLE_ARGS+=(--pantanal.console.port "$CONSOLE_PORT")
+    CONSOLE_ARGS+=(--pantanal.console.addr "127.0.0.1")
+    CONSOLE_ARGS+=(--pantanal.console.passwordfile "$CONSOLE_PASSWORD_FILE")
     log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
 }
 
@@ -383,6 +472,9 @@ start_geth() {
             ;;
     esac
     GCMODE=$gcmode
+    if ! ensure_console_password; then
+        return 1
+    fi
     if ! geth=$(geth_path); then
         sync_geth
         geth=$(geth_path)
@@ -391,25 +483,30 @@ start_geth() {
     save_node_conf
     if pid=$(running_pid); then
         log "geth 已在运行 (PID ${pid})"
+        apply_firewall
         return 0
     fi
-    log "启动 Pantanal 公链节点 (gcmode ${gcmode})"
-    local -a args=()
-    console_args args
-    nohup "$geth" \
-        --Pantanal \
-        --datadir "$DATADIR" \
-        --port "$P2P_PORT" \
-        --syncmode full \
-        --gcmode "$gcmode" \
-        --http \
-        --http.addr "$HTTP_ADDR" \
-        --http.port "$HTTP_PORT" \
-        --http.api "$HTTP_API" \
-        --maxpeers 100 \
-        --verbosity 3 \
-        "${args[@]}" \
-        >> "$LOG_FILE" 2>&1 < /dev/null &
+    log "启动 Pantanal 公链节点 (${OS_ID}, gcmode ${gcmode})"
+    console_args || return 1
+    local -a cmd
+    cmd=(
+        "$geth"
+        --Pantanal
+        --datadir "$DATADIR"
+        --port "$P2P_PORT"
+        --syncmode full
+        --gcmode "$gcmode"
+        --http
+        --http.addr "$HTTP_ADDR"
+        --http.port "$HTTP_PORT"
+        --http.api "$HTTP_API"
+        --maxpeers 100
+        --verbosity 3
+    )
+    if ((${#CONSOLE_ARGS[@]} > 0)); then
+        cmd+=("${CONSOLE_ARGS[@]}")
+    fi
+    nohup "${cmd[@]}" >> "$LOG_FILE" 2>&1 < /dev/null &
     pid=$!
     printf '%s\n' "$pid" > "$PID_FILE"
     disown "$pid" 2>/dev/null || true
@@ -420,16 +517,41 @@ start_geth() {
         log "P2P: ${P2P_PORT}"
         log "HTTP: http://${HTTP_ADDR}:${HTTP_PORT}"
         log "日志: ${LOG_FILE}"
+        apply_firewall
         return 0
     fi
     log "geth 启动失败，查看日志: ${LOG_FILE}"
     return 1
 }
 
+apply_firewall() {
+    local script status geth
+    command -v curl >/dev/null 2>&1 || {
+        log "需要 curl 才能配置防火墙"
+        return 1
+    }
+    if geth=$(geth_path 2>/dev/null); then
+        export PANTANAL_GETH="$geth"
+    fi
+    script=$(mktemp)
+    log "配置节点防火墙 (${OS_ID}): ${FIREWALL_URL}"
+    if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 30 -o "$script" "$FIREWALL_URL"; then
+        rm -f "$script"
+        log "下载防火墙脚本失败"
+        return 1
+    fi
+    bash "$script" "$OS_ID" && status=0 || status=$?
+    rm -f "$script"
+    return "$status"
+}
+
 install_node() {
     local gcmode="${1:-full}"
     load_node_conf
     GCMODE=$gcmode
+    if ! ensure_console_password; then
+        return 1
+    fi
     save_node_conf
     sync_geth
     stop_geth
@@ -440,6 +562,7 @@ show_status() {
     local pid block chain
     load_node_conf
     log "=== Pantanal geth ==="
+    log "系统: ${OS_ID} ${ARCH}"
     if pid=$(running_pid); then
         log "运行中 (PID ${pid})"
     else
@@ -492,12 +615,13 @@ start_command() {
         return 0
     fi
     log "geth 已在运行，且已是最新版本 (PID $(running_pid))"
+    apply_firewall
 }
 
 guide_install() {
     load_node_conf
     choose_gcmode
-    choose_console
+    require_console_password
     save_node_conf
     sync_geth
     if [[ "$GETH_UPDATED" == 1 ]]; then
@@ -512,6 +636,8 @@ guide_install() {
         if [[ "$choice" == 2 ]]; then
             stop_geth
             start_geth "$GCMODE"
+        else
+            apply_firewall
         fi
         return 0
     fi
@@ -528,16 +654,16 @@ guide_start() {
     local choice
     if [[ -f "$NODE_CONF" ]]; then
         choice=$(prompt_choice "启动方式" \
-            "使用上次的设置（gcmode ${GCMODE}，控制台 ${CONSOLE}）" \
-            "重新选择状态模式和控制台")
+            "使用上次的设置（gcmode ${GCMODE}）" \
+            "重新选择状态模式并设置控制台口令")
         if [[ "$choice" == 2 ]]; then
             choose_gcmode
-            choose_console
+            require_console_password
             save_node_conf
         fi
     else
         choose_gcmode
-        choose_console
+        require_console_password
         save_node_conf
     fi
     sync_geth
@@ -552,6 +678,8 @@ guide_start() {
         if [[ "$choice" == 2 ]]; then
             stop_geth
             start_geth "$GCMODE"
+        else
+            apply_firewall
         fi
         return 0
     fi
@@ -582,7 +710,7 @@ show_help() {
     cat <<EOF
 Pantanal 公链节点
 
-直接运行会逐步选择状态模式和手机控制台。
+直接运行会选择状态模式，并设置手机控制台口令。
 发现更新的 Release 时覆盖 geth 并重启节点。
 
 用法: $(basename "$0") <command>
@@ -595,12 +723,18 @@ Pantanal 公链节点
   help                显示此说明
 
 公链参数由 geth --Pantanal 决定：NetworkId 1122、内置创世块、公网 bootnode。
-数据目录为 ${DATADIR}。同步模式为 full。
+当前系统 ${OS_ID} (${ARCH})。数据目录 ${DATADIR}，程序目录 ${BIN_DIR}。
+同步模式为 full。
 发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
 
-手机控制台只绑定 127.0.0.1:${CONSOLE_PORT}，不接受外网连接。
+部署时必须设置手机控制台口令，至少 8 个字符。
+控制台只绑定 127.0.0.1:${CONSOLE_PORT}，不接受外网连接。
 口令写入 ${DATADIR}/console.password，权限为仅所有者可读。
+非交互安装可事先设置 PANTANAL_CONSOLE_PASSWORD，脚本把它写入口令文件。
 口令不进入命令行，也不写入 geth.log。
+节点启动后执行 ${FIREWALL_URL} ${OS_ID}。
+Ubuntu 与 Debian 使用 ufw，Fedora、RHEL 及兼容系统使用 firewalld，macOS 使用应用程序防火墙，Windows 使用 Windows 防火墙。
+放行 SSH 与 P2P ${P2P_PORT}。
 EOF
 }
 
@@ -645,4 +779,5 @@ main() {
     esac
 }
 
+detect_platform || exit 1
 main "$@"
