@@ -1,7 +1,10 @@
 #!/bin/bash
 # Pantanal 公链节点安装与管理。
 #
-# 直接运行时选择状态模式，并设置手机控制台口令。
+# 直接运行时选择部署模式，并设置手机控制台口令。
+# 部署模式：同步节点、归档节点、出块节点、归档出块节点。
+# 出块模式可以选择输入私钥，或读取密钥文件。
+# 这枚私钥是本机验证节点账户，写入数据目录 sealer.key，权限仅所有者可读。
 # 发现更新的 Release 时覆盖已安装的 geth，并重启节点。
 # --Pantanal 写入 NetworkId 1122、创世块和公网 bootnode。同步模式为 full。
 # 按本机系统选择目录、发布包和防火墙：Ubuntu、Debian、Fedora、RHEL、macOS、Windows。
@@ -19,6 +22,8 @@ CONSOLE_PORT=8790
 
 GETH_UPDATED=0
 GCMODE=full
+SEALER=off
+SEALER_KEY_FILE=""
 CONSOLE=local
 CONSOLE_PASSWORD_FILE=""
 
@@ -113,6 +118,7 @@ detect_platform() {
     LOG_FILE="${DATADIR}/geth.log"
     PID_FILE="${DATADIR}/geth.pid"
     STAMP_FILE="${DATADIR}/geth.release"
+    RUN_MODE_FILE="${DATADIR}/geth.mode"
     NODE_CONF="${DATADIR}/node.conf"
     log "系统: ${OS_ID} ${ARCH}"
 }
@@ -200,6 +206,8 @@ ensure_datadir() {
 
 load_node_conf() {
     GCMODE=full
+    SEALER=off
+    SEALER_KEY_FILE="${DATADIR}/sealer.key"
     CONSOLE=local
     CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
     [[ -f "$NODE_CONF" ]] || return 0
@@ -207,31 +215,256 @@ load_node_conf() {
     while IFS='=' read -r key value; do
         case "$key" in
             GCMODE) GCMODE=$value ;;
+            SEALER) SEALER=$value ;;
+            SEALER_KEY_FILE) SEALER_KEY_FILE=$value ;;
             CONSOLE) CONSOLE=$value ;;
             CONSOLE_PASSWORD_FILE) CONSOLE_PASSWORD_FILE=$value ;;
         esac
     done < "$NODE_CONF"
     [[ "$GCMODE" == archive ]] || GCMODE=full
+    [[ "$SEALER" == on ]] || SEALER=off
+    [[ -n "$SEALER_KEY_FILE" ]] || SEALER_KEY_FILE="${DATADIR}/sealer.key"
     CONSOLE=local
 }
 
 save_node_conf() {
     ensure_datadir
+    SEALER_KEY_FILE="${DATADIR}/sealer.key"
     umask 077
     cat > "$NODE_CONF" <<EOF
 GCMODE=${GCMODE}
+SEALER=${SEALER}
+SEALER_KEY_FILE=${SEALER_KEY_FILE}
 CONSOLE=${CONSOLE}
 CONSOLE_PASSWORD_FILE=${CONSOLE_PASSWORD_FILE}
 EOF
     chmod 600 "$NODE_CONF"
 }
 
-console_password_mode() {
-    if [[ "$OS_FAMILY" == macos ]]; then
-        stat -f '%OLp' "$CONSOLE_PASSWORD_FILE" 2>/dev/null || true
+apply_deploy_mode() {
+    local mode
+    mode=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$mode" in
+        full|sync)
+            GCMODE=full
+            SEALER=off
+            ;;
+        archive)
+            GCMODE=archive
+            SEALER=off
+            ;;
+        seal)
+            GCMODE=full
+            SEALER=on
+            ;;
+        archive-seal|archive_seal)
+            GCMODE=archive
+            SEALER=on
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+mode_label() {
+    if [[ "$SEALER" == on && "$GCMODE" == archive ]]; then
+        printf '归档出块节点'
+    elif [[ "$SEALER" == on ]]; then
+        printf '出块节点'
+    elif [[ "$GCMODE" == archive ]]; then
+        printf '归档节点'
     else
-        stat -c '%a' "$CONSOLE_PASSWORD_FILE" 2>/dev/null || true
+        printf '同步节点'
     fi
+}
+
+normalize_sealer_hex() {
+    local raw="$1"
+    raw=$(printf '%s' "$raw" | tr -d '[:space:]')
+    raw=${raw#0x}
+    raw=${raw#0X}
+    [[ "$raw" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    [[ "$raw" == "0000000000000000000000000000000000000000000000000000000000000000" ]] && return 1
+    printf '%s' "$raw"
+}
+
+read_sealer_hex() {
+    local file="$1" raw
+    [[ -n "$file" && -f "$file" && -r "$file" ]] || return 1
+    raw=$(head -c 256 < "$file" | tr -d '[:space:]') || return 1
+    normalize_sealer_hex "$raw"
+}
+
+sealer_key_ok() {
+    local mode
+    SEALER_KEY_FILE="${DATADIR}/sealer.key"
+    [[ -f "$SEALER_KEY_FILE" ]] || return 1
+    mode=$(file_mode "$SEALER_KEY_FILE")
+    [[ "$mode" == "600" ]] || return 1
+    read_sealer_hex "$SEALER_KEY_FILE" >/dev/null
+}
+
+write_sealer_hex() {
+    local hex
+    hex=$(normalize_sealer_hex "$1") || return 1
+    ensure_datadir
+    SEALER_KEY_FILE="${DATADIR}/sealer.key"
+    umask 077
+    printf '%s\n' "$hex" > "$SEALER_KEY_FILE"
+    chmod 600 "$SEALER_KEY_FILE"
+    unset hex
+    log "已写入验证节点私钥，权限仅所有者可读"
+}
+
+install_sealer_key() {
+    local hex
+    hex=$(read_sealer_hex "$1") || return 1
+    write_sealer_hex "$hex"
+    unset hex
+}
+
+install_sealer_source() {
+    local src="$1"
+    if [[ -n "$src" && -f "$src" && -r "$src" ]]; then
+        install_sealer_key "$src"
+        return
+    fi
+    write_sealer_hex "$src"
+}
+
+prompt_sealer_privkey() {
+    local first second
+    while true; do
+        printf '验证节点私钥（64 位十六进制，输入不回显）: ' >/dev/tty
+        IFS= read -rs first </dev/tty || return 1
+        printf '\n请再次输入: ' >/dev/tty
+        IFS= read -rs second </dev/tty || return 1
+        printf '\n' >/dev/tty
+        if [[ -n "$first" && "$first" == "$second" ]] && write_sealer_hex "$first"; then
+            unset first second
+            return 0
+        fi
+        unset first second
+        printf '两次输入不一致，或不是 64 位十六进制私钥\n' >/dev/tty
+    done
+}
+
+prompt_sealer_key() {
+    local path
+    while true; do
+        printf '验证节点私钥文件路径: ' >/dev/tty
+        IFS= read -r path </dev/tty || return 1
+        if [[ -n "$path" ]] && install_sealer_key "$path"; then
+            return 0
+        fi
+        printf '文件不存在，或内容不是 64 位十六进制私钥\n' >/dev/tty
+    done
+}
+
+choose_sealer_input() {
+    local choice
+    choice=$(prompt_choice "验证节点账户" \
+        "输入私钥" \
+        "使用密钥文件")
+    if [[ "$choice" == 2 ]]; then
+        prompt_sealer_key
+        return $?
+    fi
+    prompt_sealer_privkey
+}
+
+apply_explicit_sealer_key() {
+    local env_key="${PANTANAL_SEALER_KEY:-}"
+    [[ "$SEALER" == on && -n "$env_key" ]] || return 0
+    if install_sealer_source "$env_key"; then
+        return 0
+    fi
+    log "PANTANAL_SEALER_KEY 不是有效的私钥或密钥文件"
+    return 1
+}
+
+explain_sealer_key() {
+    local mode
+    if [[ ! -f "$SEALER_KEY_FILE" ]]; then
+        log "出块模式需要验证节点私钥。在终端中输入，把私钥或密钥文件路径放在 PANTANAL_SEALER_KEY，或事先写入 ${SEALER_KEY_FILE}。私钥不进入命令行，也不写入 geth.log。"
+        return 0
+    fi
+    mode=$(file_mode "$SEALER_KEY_FILE")
+    if [[ "$mode" != "600" ]]; then
+        log "密封密钥文件权限必须仅为所有者可读: ${SEALER_KEY_FILE}"
+        return 0
+    fi
+    log "密封密钥内容不是 64 位十六进制私钥: ${SEALER_KEY_FILE}"
+}
+
+ensure_sealer_key() {
+    local env_key="${PANTANAL_SEALER_KEY:-}"
+    SEALER_KEY_FILE="${DATADIR}/sealer.key"
+    if [[ "$SEALER" != on ]]; then
+        return 0
+    fi
+    if sealer_key_ok; then
+        return 0
+    fi
+    if [[ -n "$env_key" ]]; then
+        if install_sealer_source "$env_key" && sealer_key_ok; then
+            return 0
+        fi
+        log "PANTANAL_SEALER_KEY 不是有效的私钥或密钥文件"
+    fi
+    if [[ -f "$SEALER_KEY_FILE" ]] && ! sealer_key_ok; then
+        explain_sealer_key
+    fi
+    if have_tty; then
+        choose_sealer_input
+        return $?
+    fi
+    if ! sealer_key_ok; then
+        if [[ ! -f "$SEALER_KEY_FILE" ]]; then
+            explain_sealer_key
+        fi
+        return 1
+    fi
+}
+
+configure_sealer_interactive() {
+    local choice
+    [[ "$SEALER" == on ]] || return 0
+    if sealer_key_ok; then
+        choice=$(prompt_choice "本机已有验证节点账户" \
+            "继续使用" \
+            "输入新的私钥" \
+            "更换密钥文件")
+        case "$choice" in
+            2) prompt_sealer_privkey ;;
+            3) prompt_sealer_key ;;
+            *) return 0 ;;
+        esac
+        return $?
+    fi
+    ensure_sealer_key
+}
+
+file_mode() {
+    if [[ "$OS_FAMILY" == macos ]]; then
+        stat -f '%OLp' "$1" 2>/dev/null || true
+    else
+        stat -c '%a' "$1" 2>/dev/null || true
+    fi
+}
+
+file_sha() {
+    [[ -f "$1" ]] || return 0
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+console_password_mode() {
+    file_mode "$CONSOLE_PASSWORD_FILE"
 }
 
 console_password_ok() {
@@ -278,17 +511,20 @@ ensure_console_password() {
     return 1
 }
 
-choose_gcmode() {
+choose_deploy_mode() {
     local choice
-    choice=$(prompt_choice "选择状态保留方式" \
-        "full：普通全节点，只保留当前状态" \
-        "archive：归档节点，保留全部历史状态")
-    if [[ "$choice" == 2 ]]; then
-        GCMODE=archive
-    else
-        GCMODE=full
-    fi
-    log "状态模式: ${GCMODE}"
+    choice=$(prompt_choice "选择部署模式" \
+        "同步节点：只保留当前状态，不出块" \
+        "归档节点：保留全部历史状态，不出块" \
+        "出块节点：只保留当前状态，用自己的私钥作为验证节点账户" \
+        "归档出块节点：保留全部历史状态，用自己的私钥作为验证节点账户")
+    case "$choice" in
+        2) apply_deploy_mode archive ;;
+        3) apply_deploy_mode seal ;;
+        4) apply_deploy_mode archive-seal ;;
+        *) apply_deploy_mode full ;;
+    esac
+    log "部署模式: $(mode_label)"
 }
 
 require_console_password() {
@@ -461,18 +697,24 @@ console_args() {
     log "手机控制台: 127.0.0.1:${CONSOLE_PORT}"
 }
 
+write_run_mode() {
+    printf '%s %s\n' "$GCMODE" "$SEALER" > "$RUN_MODE_FILE"
+}
+
 start_geth() {
-    local gcmode="${1:-$GCMODE}"
     local geth pid
-    case "$gcmode" in
+    case "$GCMODE" in
         full|archive) ;;
         *)
             log "gcmode 只能是 full 或 archive"
             return 1
             ;;
     esac
-    GCMODE=$gcmode
+    [[ "$SEALER" == on || "$SEALER" == off ]] || SEALER=off
     if ! ensure_console_password; then
+        return 1
+    fi
+    if ! ensure_sealer_key; then
         return 1
     fi
     if ! geth=$(geth_path); then
@@ -486,7 +728,7 @@ start_geth() {
         apply_firewall
         return 0
     fi
-    log "启动 Pantanal 公链节点 (${OS_ID}, gcmode ${gcmode})"
+    log "启动 Pantanal 公链节点 (${OS_ID}, $(mode_label))"
     console_args || return 1
     local -a cmd
     cmd=(
@@ -495,7 +737,7 @@ start_geth() {
         --datadir "$DATADIR"
         --port "$P2P_PORT"
         --syncmode full
-        --gcmode "$gcmode"
+        --gcmode "$GCMODE"
         --http
         --http.addr "$HTTP_ADDR"
         --http.port "$HTTP_PORT"
@@ -503,6 +745,12 @@ start_geth() {
         --maxpeers 100
         --verbosity 3
     )
+    if [[ "$SEALER" == on ]]; then
+        cmd+=(--pantanal.sealerkey "$SEALER_KEY_FILE")
+        log "密封密钥: ${SEALER_KEY_FILE}"
+    else
+        log "本次不加载密封密钥"
+    fi
     if ((${#CONSOLE_ARGS[@]} > 0)); then
         cmd+=("${CONSOLE_ARGS[@]}")
     fi
@@ -512,6 +760,7 @@ start_geth() {
     disown "$pid" 2>/dev/null || true
     sleep 3
     if kill -0 "$pid" 2>/dev/null; then
+        write_run_mode
         log "geth 已启动 (PID ${pid})"
         log "数据目录: ${DATADIR}"
         log "P2P: ${P2P_PORT}"
@@ -546,16 +795,26 @@ apply_firewall() {
 }
 
 install_node() {
-    local gcmode="${1:-full}"
+    local mode="${1:-full}"
     load_node_conf
-    GCMODE=$gcmode
+    if ! apply_deploy_mode "$mode"; then
+        log "部署模式只能是 full、archive、seal、archive-seal"
+        return 1
+    fi
+    log "部署模式: $(mode_label)"
+    if ! apply_explicit_sealer_key; then
+        return 1
+    fi
+    if ! ensure_sealer_key; then
+        return 1
+    fi
     if ! ensure_console_password; then
         return 1
     fi
     save_node_conf
     sync_geth
     stop_geth
-    start_geth "$gcmode"
+    start_geth
 }
 
 show_status() {
@@ -568,7 +827,32 @@ show_status() {
     else
         log "未运行"
     fi
+    log "部署模式: $(mode_label)"
     log "gcmode: ${GCMODE}"
+    if [[ "$SEALER" == on ]]; then
+        if sealer_key_ok; then
+            log "密封密钥: 已配置"
+        else
+            log "密封密钥: 不可用"
+        fi
+    else
+        log "密封密钥: 不加载"
+    fi
+    if pid=$(running_pid) && [[ -f "$RUN_MODE_FILE" ]]; then
+        local run_gc run_sealer saved_gc saved_sealer
+        read -r run_gc run_sealer < "$RUN_MODE_FILE" || true
+        saved_gc=$GCMODE
+        saved_sealer=$SEALER
+        if [[ -n "$run_gc" && -n "$run_sealer" && ( "$run_gc" != "$saved_gc" || "$run_sealer" != "$saved_sealer" ) ]]; then
+            local saved_label
+            saved_label=$(mode_label)
+            GCMODE=$run_gc
+            SEALER=$run_sealer
+            log "进程仍是上次启动的$(mode_label)。保存的模式是${saved_label}，重启后生效"
+            GCMODE=$saved_gc
+            SEALER=$saved_sealer
+        fi
+    fi
     log "手机控制台: ${CONSOLE}"
     chain=$(curl -fsS -m 3 -X POST "http://${HTTP_ADDR}:${HTTP_PORT}" \
         -H 'Content-Type: application/json' \
@@ -591,7 +875,8 @@ monitor() {
     sync_geth
     if [[ "$GETH_UPDATED" == 1 ]]; then
         log "已覆盖新版本，正在重启"
-        start_geth "$GCMODE"
+        stop_geth
+        start_geth
         return 0
     fi
     if running_pid >/dev/null; then
@@ -599,19 +884,38 @@ monitor() {
         return 0
     fi
     log "geth 未运行，正在启动"
-    start_geth "$GCMODE"
+    start_geth
 }
 
 start_command() {
     local mode="${1:-}"
     load_node_conf
+    local prev_gc="$GCMODE" prev_sealer="$SEALER" before_key="" after_key=""
+    before_key=$(file_sha "${DATADIR}/sealer.key")
     if [[ -n "$mode" ]]; then
-        GCMODE=$mode
+        if ! apply_deploy_mode "$mode"; then
+            log "部署模式只能是 full、archive、seal、archive-seal"
+            return 1
+        fi
+        log "部署模式: $(mode_label)"
+        if ! apply_explicit_sealer_key; then
+            return 1
+        fi
         save_node_conf
     fi
+    after_key=$(file_sha "${DATADIR}/sealer.key")
     sync_geth
     if [[ "$GETH_UPDATED" == 1 ]] || ! running_pid >/dev/null; then
-        start_geth "$GCMODE"
+        if running_pid >/dev/null; then
+            stop_geth
+        fi
+        start_geth
+        return 0
+    fi
+    if [[ -n "$mode" && ( "$prev_gc" != "$GCMODE" || "$prev_sealer" != "$SEALER" || "$before_key" != "$after_key" ) ]]; then
+        log "部署模式已变更，正在重启"
+        stop_geth
+        start_geth
         return 0
     fi
     log "geth 已在运行，且已是最新版本 (PID $(running_pid))"
@@ -620,23 +924,26 @@ start_command() {
 
 guide_install() {
     load_node_conf
-    choose_gcmode
+    choose_deploy_mode
+    configure_sealer_interactive || return 1
     require_console_password
     save_node_conf
     sync_geth
     if [[ "$GETH_UPDATED" == 1 ]]; then
-        start_geth "$GCMODE"
+        stop_geth
+        start_geth
         return 0
     fi
     local choice
     if running_pid >/dev/null; then
-        choice=$(prompt_choice "geth 已是最新版本，并且正在运行" \
+        choice=$(prompt_choice "geth 已是最新版本，并且正在运行。本次选择：$(mode_label)" \
             "保持运行" \
             "按本次选择重启")
         if [[ "$choice" == 2 ]]; then
             stop_geth
-            start_geth "$GCMODE"
+            start_geth
         else
+            log "已保存部署模式：$(mode_label)。当前进程保持运行，下次启动时生效"
             apply_firewall
         fi
         return 0
@@ -645,45 +952,56 @@ guide_install() {
         "现在启动" \
         "稍后再启动")
     if [[ "$choice" == 1 ]]; then
-        start_geth "$GCMODE"
+        start_geth
     fi
 }
 
 guide_start() {
     load_node_conf
-    local choice
+    local choice reconfigured=0
     if [[ -f "$NODE_CONF" ]]; then
         choice=$(prompt_choice "启动方式" \
-            "使用上次的设置（gcmode ${GCMODE}）" \
-            "重新选择状态模式并设置控制台口令")
+            "使用上次的设置（$(mode_label)）" \
+            "重新选择部署模式并设置控制台口令")
         if [[ "$choice" == 2 ]]; then
-            choose_gcmode
+            choose_deploy_mode
+            configure_sealer_interactive || return 1
             require_console_password
             save_node_conf
+            reconfigured=1
         fi
     else
-        choose_gcmode
+        choose_deploy_mode
+        configure_sealer_interactive || return 1
         require_console_password
         save_node_conf
+        reconfigured=1
     fi
     sync_geth
     if [[ "$GETH_UPDATED" == 1 ]]; then
-        start_geth "$GCMODE"
+        stop_geth
+        start_geth
         return 0
     fi
     if running_pid >/dev/null; then
-        choice=$(prompt_choice "geth 正在运行" \
+        if [[ "$reconfigured" == 0 ]]; then
+            log "geth 正在运行 (PID $(running_pid))"
+            apply_firewall
+            return 0
+        fi
+        choice=$(prompt_choice "geth 正在运行。本次选择：$(mode_label)" \
             "保持运行" \
             "按本次选择重启")
         if [[ "$choice" == 2 ]]; then
             stop_geth
-            start_geth "$GCMODE"
+            start_geth
         else
+            log "已保存部署模式：$(mode_label)。当前进程保持运行，下次启动时生效"
             apply_firewall
         fi
         return 0
     fi
-    start_geth "$GCMODE"
+    start_geth
 }
 
 interactive_menu() {
@@ -710,16 +1028,25 @@ show_help() {
     cat <<EOF
 Pantanal 公链节点
 
-直接运行会选择状态模式，并设置手机控制台口令。
+直接运行会选择部署模式，并设置手机控制台口令。
 发现更新的 Release 时覆盖 geth 并重启节点。
 
-用法: $(basename "$0") <command>
+用法: $(basename "$0") <command> [mode]
 
-  install [archive]   非交互安装。不带参数且在终端中运行时进入选择菜单
-  start [archive]     启动节点。有新版本时先覆盖再重启
+部署模式:
+  full            同步节点。只保留当前状态，不出块。这也是默认模式
+  archive         归档节点。保留全部历史状态，不出块
+  seal            出块节点。只保留当前状态，并加载密封密钥
+  archive-seal    归档出块节点。保留全部历史状态，并加载密封密钥
+  sync            与 full 相同
+
+  install [mode]      安装并启动。不带 mode 且在终端中运行时进入选择菜单
+  start [mode]        启动节点。不带 mode 时沿用上次的部署模式
+                      带 mode 且与正在运行的模式不同时，先停止再按新模式启动
+                      有新版本时先覆盖再重启
   stop                停止节点
-  status              查看进程和链 ID
-  monitor             巡检。有新版本时覆盖并重启，退出后按上次的设置拉起
+  status              查看进程、部署模式和链 ID
+  monitor             巡检。有新版本时覆盖并重启，退出后按上次的部署模式拉起
   help                显示此说明
 
 公链参数由 geth --Pantanal 决定：NetworkId 1122、内置创世块、公网 bootnode。
@@ -727,10 +1054,18 @@ Pantanal 公链节点
 同步模式为 full。
 发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
 
+出块模式用运营者自己的 64 位十六进制私钥作为验证节点账户。
+交互运行时可以选择输入私钥，或填写密钥文件路径。输入时不回显，并再输入一次确认。
+脚本把私钥写入 ${DATADIR}/sealer.key，权限仅所有者可读，并以 --pantanal.sealerkey 加载。
+非交互出块可把 PANTANAL_SEALER_KEY 设为这枚私钥，或设为密钥文件路径。已有合法的 sealer.key 时直接使用。
+没有可用私钥时，出块模式不启动节点。私钥不进入命令行，也不写入 geth.log。
+同步节点和归档节点不加载密封密钥。
+
 部署时必须设置手机控制台口令，至少 8 个字符。
 控制台只绑定 127.0.0.1:${CONSOLE_PORT}，不接受外网连接。
 口令写入 ${DATADIR}/console.password，权限为仅所有者可读。
 非交互安装可事先设置 PANTANAL_CONSOLE_PASSWORD，脚本把它写入口令文件。
+非交互安装也可以设置 PANTANAL_MODE 为 full、archive、seal 或 archive-seal。
 口令不进入命令行，也不写入 geth.log。
 节点启动后执行 ${FIREWALL_URL} ${OS_ID}。
 Ubuntu 与 Debian 使用 ufw，Fedora、RHEL 及兼容系统使用 firewalld，macOS 使用应用程序防火墙，Windows 使用 Windows 防火墙。
@@ -740,20 +1075,19 @@ EOF
 
 main() {
     local command="${1:-}"
-    local mode="${2:-full}"
     case "$command" in
         "")
             if have_tty; then
                 interactive_menu
             else
-                install_node full
+                install_node "${PANTANAL_MODE:-full}"
             fi
             ;;
         install)
             if [[ -z "${2:-}" && $(have_tty && echo yes || true) == yes ]]; then
                 interactive_menu
             else
-                install_node "$mode"
+                install_node "${2:-${PANTANAL_MODE:-full}}"
             fi
             ;;
         start)
