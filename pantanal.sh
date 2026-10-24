@@ -3,8 +3,10 @@
 #
 # 直接运行时选择部署模式，并设置手机控制台口令。
 # 部署模式：同步节点、归档节点、出块节点、归档出块节点。
-# 出块模式可以选择输入私钥，或读取密钥文件。
-# 这枚私钥是本机验证节点账户，写入数据目录 sealer.key，权限仅所有者可读。
+# 出块模式可以输入私钥，或读取密钥文件，或跳过账户创建。
+# 安装脚本不生成私钥，也不生成账户。
+# 跳过时部署模式保持不变。账户稍后由运营者执行 geth account new 生成。
+# 提供的私钥写入数据目录 sealer.key，权限仅所有者可读。
 # 发现更新的 Release 时覆盖已安装的 geth，并重启节点。
 # --Pantanal 写入 NetworkId 1122、创世块和公网 bootnode。同步模式为 full。
 # 按本机系统选择目录、发布包和防火墙：Ubuntu、Debian、Fedora、RHEL、macOS、Windows。
@@ -207,6 +209,7 @@ ensure_datadir() {
 load_node_conf() {
     GCMODE=full
     SEALER=off
+    SEALER_ACCOUNT=now
     SEALER_KEY_FILE="${DATADIR}/sealer.key"
     CONSOLE=local
     CONSOLE_PASSWORD_FILE="${DATADIR}/console.password"
@@ -216,6 +219,7 @@ load_node_conf() {
         case "$key" in
             GCMODE) GCMODE=$value ;;
             SEALER) SEALER=$value ;;
+            SEALER_ACCOUNT) SEALER_ACCOUNT=$value ;;
             SEALER_KEY_FILE) SEALER_KEY_FILE=$value ;;
             CONSOLE) CONSOLE=$value ;;
             CONSOLE_PASSWORD_FILE) CONSOLE_PASSWORD_FILE=$value ;;
@@ -223,6 +227,7 @@ load_node_conf() {
     done < "$NODE_CONF"
     [[ "$GCMODE" == archive ]] || GCMODE=full
     [[ "$SEALER" == on ]] || SEALER=off
+    [[ "$SEALER_ACCOUNT" == later ]] || SEALER_ACCOUNT=now
     [[ -n "$SEALER_KEY_FILE" ]] || SEALER_KEY_FILE="${DATADIR}/sealer.key"
     CONSOLE=local
 }
@@ -234,6 +239,7 @@ save_node_conf() {
     cat > "$NODE_CONF" <<EOF
 GCMODE=${GCMODE}
 SEALER=${SEALER}
+SEALER_ACCOUNT=${SEALER_ACCOUNT}
 SEALER_KEY_FILE=${SEALER_KEY_FILE}
 CONSOLE=${CONSOLE}
 CONSOLE_PASSWORD_FILE=${CONSOLE_PASSWORD_FILE}
@@ -314,7 +320,18 @@ write_sealer_hex() {
     printf '%s\n' "$hex" > "$SEALER_KEY_FILE"
     chmod 600 "$SEALER_KEY_FILE"
     unset hex
+    SEALER_ACCOUNT=now
     log "已写入验证节点私钥，权限仅所有者可读"
+}
+
+skip_sealer_account() {
+    SEALER_ACCOUNT=later
+    log "部署模式保持为$(mode_label)。安装脚本不生成账户。"
+    if sealer_key_ok; then
+        log "已有密封密钥继续使用"
+        return 0
+    fi
+    log "稍后在本机生成账户: geth account new --datadir ${DATADIR}"
 }
 
 install_sealer_key() {
@@ -366,12 +383,13 @@ choose_sealer_input() {
     local choice
     choice=$(prompt_choice "验证节点账户" \
         "输入私钥" \
-        "使用密钥文件")
-    if [[ "$choice" == 2 ]]; then
-        prompt_sealer_key
-        return $?
-    fi
-    prompt_sealer_privkey
+        "使用密钥文件" \
+        "跳过创建账户，稍后在 geth 中生成")
+    case "$choice" in
+        2) prompt_sealer_key ;;
+        3) skip_sealer_account ;;
+        *) prompt_sealer_privkey ;;
+    esac
 }
 
 apply_explicit_sealer_key() {
@@ -387,7 +405,7 @@ apply_explicit_sealer_key() {
 explain_sealer_key() {
     local mode
     if [[ ! -f "$SEALER_KEY_FILE" ]]; then
-        log "出块模式需要验证节点私钥。在终端中输入，把私钥或密钥文件路径放在 PANTANAL_SEALER_KEY，或事先写入 ${SEALER_KEY_FILE}。私钥不进入命令行，也不写入 geth.log。"
+        log "出块模式需要运营者提供的验证节点私钥。安装脚本不生成私钥。可在终端中输入，把私钥或密钥文件路径放在 PANTANAL_SEALER_KEY，事先写入 ${SEALER_KEY_FILE}，或设置 PANTANAL_SEALER_ACCOUNT=skip 后执行 geth account new --datadir ${DATADIR}。私钥不进入命令行，也不写入 geth.log。"
         return 0
     fi
     mode=$(file_mode "$SEALER_KEY_FILE")
@@ -399,12 +417,16 @@ explain_sealer_key() {
 }
 
 ensure_sealer_key() {
-    local env_key="${PANTANAL_SEALER_KEY:-}"
+    local env_key="${PANTANAL_SEALER_KEY:-}" env_account="${PANTANAL_SEALER_ACCOUNT:-}"
     SEALER_KEY_FILE="${DATADIR}/sealer.key"
     if [[ "$SEALER" != on ]]; then
         return 0
     fi
+    case "$env_account" in
+        skip|later) SEALER_ACCOUNT=later ;;
+    esac
     if sealer_key_ok; then
+        SEALER_ACCOUNT=now
         return 0
     fi
     if [[ -n "$env_key" ]]; then
@@ -413,19 +435,20 @@ ensure_sealer_key() {
         fi
         log "PANTANAL_SEALER_KEY 不是有效的私钥或密钥文件"
     fi
-    if [[ -f "$SEALER_KEY_FILE" ]] && ! sealer_key_ok; then
+    if [[ "$SEALER_ACCOUNT" == later ]]; then
+        log "部署模式保持为$(mode_label)。安装脚本不生成账户。"
+        log "稍后在本机生成账户: geth account new --datadir ${DATADIR}"
+        return 0
+    fi
+    if [[ -f "$SEALER_KEY_FILE" ]]; then
         explain_sealer_key
     fi
     if have_tty; then
         choose_sealer_input
         return $?
     fi
-    if ! sealer_key_ok; then
-        if [[ ! -f "$SEALER_KEY_FILE" ]]; then
-            explain_sealer_key
-        fi
-        return 1
-    fi
+    explain_sealer_key
+    return 1
 }
 
 configure_sealer_interactive() {
@@ -435,15 +458,17 @@ configure_sealer_interactive() {
         choice=$(prompt_choice "本机已有验证节点账户" \
             "继续使用" \
             "输入新的私钥" \
-            "更换密钥文件")
+            "更换密钥文件" \
+            "跳过创建账户，稍后在 geth 中生成")
         case "$choice" in
             2) prompt_sealer_privkey ;;
             3) prompt_sealer_key ;;
+            4) skip_sealer_account ;;
             *) return 0 ;;
         esac
         return $?
     fi
-    ensure_sealer_key
+    choose_sealer_input
 }
 
 file_mode() {
@@ -745,9 +770,12 @@ start_geth() {
         --maxpeers 100
         --verbosity 3
     )
-    if [[ "$SEALER" == on ]]; then
+    if [[ "$SEALER" == on ]] && sealer_key_ok; then
         cmd+=(--pantanal.sealerkey "$SEALER_KEY_FILE")
         log "密封密钥: ${SEALER_KEY_FILE}"
+    elif [[ "$SEALER" == on ]]; then
+        log "部署模式保持为$(mode_label)。本次不加载密封密钥。"
+        log "稍后在本机生成账户: geth account new --datadir ${DATADIR}"
     else
         log "本次不加载密封密钥"
     fi
@@ -832,6 +860,8 @@ show_status() {
     if [[ "$SEALER" == on ]]; then
         if sealer_key_ok; then
             log "密封密钥: 已配置"
+        elif [[ "$SEALER_ACCOUNT" == later ]]; then
+            log "验证节点账户: 稍后在 geth 中生成。部署模式保持为$(mode_label)"
         else
             log "密封密钥: 不可用"
         fi
@@ -1054,11 +1084,13 @@ Pantanal 公链节点
 同步模式为 full。
 发布包: ${RELEASE_BASE}/geth-<os>-<arch>.tar.gz 或 .zip
 
-出块模式用运营者自己的 64 位十六进制私钥作为验证节点账户。
-交互运行时可以选择输入私钥，或填写密钥文件路径。输入时不回显，并再输入一次确认。
-脚本把私钥写入 ${DATADIR}/sealer.key，权限仅所有者可读，并以 --pantanal.sealerkey 加载。
-非交互出块可把 PANTANAL_SEALER_KEY 设为这枚私钥，或设为密钥文件路径。已有合法的 sealer.key 时直接使用。
-没有可用私钥时，出块模式不启动节点。私钥不进入命令行，也不写入 geth.log。
+出块模式的验证节点私钥由运营者自己提供。安装脚本不生成私钥，也不生成账户。
+交互运行时可以输入私钥、填写密钥文件路径，或跳过创建账户。输入时不回显，并再输入一次确认。
+跳过时部署模式保持不变。账户稍后在本机执行 geth account new --datadir ${DATADIR}。
+提供的私钥写入 ${DATADIR}/sealer.key，权限仅所有者可读，并以 --pantanal.sealerkey 加载。
+非交互出块可把 PANTANAL_SEALER_KEY 设为这枚私钥或密钥文件路径。
+PANTANAL_SEALER_ACCOUNT=skip 表示跳过创建账户。已有合法的 sealer.key 时直接使用。
+未跳过且没有可用私钥时，出块模式不启动节点。私钥不进入命令行，也不写入 geth.log。
 同步节点和归档节点不加载密封密钥。
 
 部署时必须设置手机控制台口令，至少 8 个字符。
