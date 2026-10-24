@@ -19,7 +19,7 @@ FIREWALL_URL="https://pantanalchain.github.io/someScripts/setup_firewall.sh"
 P2P_PORT=30303
 HTTP_ADDR="127.0.0.1"
 HTTP_PORT=8545
-HTTP_API="eth,net,web3,admin"
+HTTP_API="eth,net,web3"
 CONSOLE_PORT=8790
 
 GETH_UPDATED=0
